@@ -1,11 +1,14 @@
 use std::{sync::Arc, time::Duration, collections::{BTreeMap, HashMap}};
 
-use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client};
+use anyhow::anyhow;
+use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client, Client};
 use serde::{Deserialize, Serialize};
 use garde::Validate;
 use schemars::JsonSchema;
-use tracing::warn;
+use tracing::{warn, info};
 use ipnet;
+use kube_runtime::finalizer;
+
 
 use crate::{instance::instance::Instance, resource::resource::{ReconcileError, ResourceClient}};
 use crate::resource::resource::Context;
@@ -42,7 +45,19 @@ impl Network{
             }
         )
     }
-    pub async fn reconcile(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {
+    pub async fn reconcile(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {        
+        info!("reconciling network: {:?}", g.metadata.name);
+        ctx.setup_finalizer(g, ctx.clone(), Network::apply, Network::cleanup).await?; 
+        Ok(Action::await_change())
+    }
+    
+    pub async fn cleanup(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {      
+        info!("cleaning up network: {:?}", g.metadata.name);
+        Ok(Action::await_change())
+    }
+
+    pub async fn apply(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {      
+        info!("reconciling network: {:?}", g.metadata.name);
         let mut network = match ctx.get::<Network>(&g.metadata).await?{
             Some(network) => {
                 network
@@ -69,6 +84,6 @@ impl Network{
     }
     pub fn error_policy(_g: Arc<Network>, error: &ReconcileError, _ctx: Arc<ResourceClient<Network>>) -> Action {
         warn!("reconcile failed: {:?}", error);
-        Action::requeue(Duration::from_secs(5 * 60))
+        Action::requeue(Duration::from_secs(1))
     }
 }

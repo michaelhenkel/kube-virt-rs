@@ -97,8 +97,8 @@ impl Ipaddress{
                         Ok(_) => {
                             ctx.update_status(&ipaddress).await?;
                         },
-                        Err(_) => {
-                            return Ok(Action::requeue(Duration::from_secs(1)));
+                        Err(e) => {
+                            return Err(e)
                         }
                     }
                 }
@@ -109,6 +109,6 @@ impl Ipaddress{
     }
     pub fn error_policy(_g: Arc<Ipaddress>, error: &ReconcileError, _ctx: Arc<ResourceClient<Ipaddress>>) -> Action {
         warn!("reconcile failed: {:?}", error);
-        Action::requeue(Duration::from_secs(5 * 60))
+        Action::requeue(Duration::from_secs(5))
     }
 }

@@ -1,10 +1,12 @@
 use core::future::IntoFuture;
+use futures::Future;
 use futures::StreamExt;
 use futures::TryFuture;
 use k8s_openapi::NamespaceResourceScope;
 use kube::core::ObjectMeta;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::json;
 use std::hash::Hash;
 use std::sync::Arc;
 use kube::api::PostParams;
@@ -25,10 +27,14 @@ use kube::{
         reflector::ObjectRef,
     }
 };
+use serde_json::Value;
+use kube::api::{Patch, PatchParams, ListParams, ObjectList};
 use async_trait::async_trait;
 
 use tracing::*;
 use futures::stream::TryStreamExt;
+use kube_runtime::finalizer::{self, finalizer, Event};
+use crate::lxdmanager::lxdmanager::LxdClient;
 
 #[derive(Debug)]
 pub struct ReconcileError(pub anyhow::Error);
@@ -41,6 +47,15 @@ impl std::fmt::Display for ReconcileError {
     }
 }
 
+trait IsResult {
+    type Ok;
+    type Err;
+}
+
+impl<T, E> IsResult for Result<T, E> {
+    type Ok = T;
+    type Err = E;
+}
 
 #[derive(Clone)]
 pub struct ResourceManager{
@@ -60,6 +75,7 @@ pub struct Context {
 pub struct ResourceClient<T> {
     pub client: Client,
     pub api: Api<T>,
+    pub lxd_client: Option<LxdClient>,
 }
 
 impl<T> ResourceClient<T>
@@ -68,11 +84,12 @@ T: kube::Resource<Scope = NamespaceResourceScope> + serde::Serialize,
 <T as kube::Resource>::DynamicType: Default,
 T: Clone + DeserializeOwned + Debug,
 {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, lxd_client: Option<LxdClient>) -> Self {
         let api = Api::<T>::all(client.clone());
         Self {
             client,
             api,
+            lxd_client,
         }
     }
     pub async fn get<R: kube::Resource>(&self, metadata: &ObjectMeta) -> Result<Option<R>, ReconcileError>
@@ -147,6 +164,69 @@ T: Clone + DeserializeOwned + Debug,
         };
         Ok(res)
     }
+
+    pub async fn setup_finalizer<R, ApplyFut, CleanupFut>(
+        &self,
+        obj: Arc<R>,
+        resource_client: Arc<ResourceClient<R>>,
+        mut apply: impl FnMut(Arc<R>, Arc<ResourceClient<R>>) -> ApplyFut,
+        mut cleanup: impl FnMut(Arc<R>, Arc<ResourceClient<R>>) -> CleanupFut,
+    ) -> Result<Action, ReconcileError>
+    where
+    <R as kube::Resource>::DynamicType: Default + Hash + Eq + Clone + std::fmt::Debug + Unpin,
+    R: kube::Resource<Scope = NamespaceResourceScope>
+        + for<'de> serde::Deserialize<'de>
+        + Clone
+        + Debug
+        + Send
+        + Sync
+        + serde::Serialize
+        + 'static,
+        ApplyFut: Future<Output = Result<Action, ReconcileError>> + 'static + Send,
+        CleanupFut: Future<Output = Result<Action, ReconcileError>> + 'static + Send,
+    {
+        let namespace = obj.meta().namespace.as_ref().unwrap();
+        let api: Api<R> = Api::namespaced(resource_client.client.clone(), namespace);
+        let res = finalizer(&api, "virt.dev/finalizer", obj, 
+        |event| async {
+            match event {
+                Event::Apply(g) => {
+                    apply(g, resource_client.clone()).await
+                
+                },
+                Event::Cleanup(g) => {
+                    cleanup(g, resource_client.clone()).await
+
+                },
+            }
+        }
+        ).await;
+
+        match res{
+            Ok(_) => {
+                Ok(Action::requeue(std::time::Duration::from_secs(5 * 60)))
+            },
+            Err(e) => {
+                match e{
+                    finalizer::Error::RemoveFinalizer(e) => {
+                        Err(ReconcileError(anyhow::anyhow!("RemoveFinalizer error: {:?}", e)))
+                    },
+                    finalizer::Error::AddFinalizer(e) => {
+                        Err(ReconcileError(anyhow::anyhow!("AddFinalizer error: {:?}", e)))
+                    },
+                    finalizer::Error::ApplyFailed(e) => {
+                        Err(ReconcileError(anyhow::anyhow!("ApplyFailed error: {:?}", e)))
+                    },
+                    finalizer::Error::CleanupFailed(e) => {
+                        Err(ReconcileError(anyhow::anyhow!("CleanupFailed error: {:?}", e)))
+                    },
+                    finalizer::Error::UnnamedObject => {
+                        Err(ReconcileError(anyhow::anyhow!("UnnamedObject error")))
+                    },
+                }
+            }
+        }
+    }
 }
 
 impl ResourceManager{
@@ -192,33 +272,6 @@ impl ResourceManager{
         Ok(())
     }
 
-    /*
-    pub async fn watch<'a, R>(&self, watch_fn: fn(r: R)) -> Result<()> 
-    where 
-    R: kube::Resource, 
-        <R as kube::Resource>::DynamicType: Default, 
-        R: kube::Resource<Scope = NamespaceResourceScope> + for<'de> serde::Deserialize<'de> + Clone + Debug + Send + Sync + 'static,
-    {
-        let api = Api::<R>::default_namespaced(self.client.clone());
-        let use_watchlist = std::env::var("WATCHLIST").map(|s| s == "1").unwrap_or(false);
-        let wc = if use_watchlist {
-            watcher::Config::default().streaming_lists()
-        } else {
-            watcher::Config::default()
-        };
-        watcher(api, wc)
-            .applied_objects()
-            .default_backoff()
-            .try_for_each(|p| async move {
-                info!("saw {}", p.name_any());
-                watch_fn(p);
-                Ok(())
-            })
-        .await?;
-        Ok(())
-    }
-    */
-
     pub async fn watch<'a, R, ReconcilerFut>(&self, ctrl: Controller<R>,
         reconciler: impl FnMut(Arc<R>, Arc<ResourceClient<R>>) -> ReconcilerFut,
         error_policy: impl Fn(Arc<R>, &ReconcilerFut::Error, Arc<ResourceClient<R>>) -> Action,
@@ -248,33 +301,16 @@ impl ResourceManager{
             .await;
         Ok(())
     }
+
+
+
 }
 
 /*
-pub async fn get<T: kube::Resource>(metadata: &ObjectMeta, client: Client) -> Result<Option<T>, ReconcileError>
-where
-T: kube::Resource<Scope = NamespaceResourceScope>,
-<T as kube::Resource>::DynamicType: Default,
-T: Clone + DeserializeOwned + Debug,
-{
-    let namespace = metadata.namespace.as_ref().unwrap();
-    let name = metadata.name.as_ref().unwrap();
-    let res_api: Api<T> = Api::namespaced(client.clone(), namespace);
-    let res = match res_api.get(name).await{
-        Ok(res) => {
-            info!("Found resource: {:?}", res.meta().name.as_ref().unwrap());
-            Some(res)
-        },
-        Err(e) => {
-            if is_not_found(&e){
-                None
-            } else {
-                return Err(ReconcileError(e.into()));
-            }
-        },
-    };
-    Ok(res)
-}
+            K: Resource + Clone + DeserializeOwned + Serialize + Debug,
+            ReconcileFut: TryFuture<Ok = Result<Action, ReconcileFut::Error>>,
+            ReconcileFut::Error: StdError + 'static,
+
 */
 
 pub fn is_not_found(e: &Error) -> bool {
@@ -303,53 +339,69 @@ pub fn is_not_found(e: &Error) -> bool {
     }
 }
 
-/*
-pub async fn create<T: kube::Resource>(t: &T, client: Client) -> Result<Option<T>, ReconcileError>
+pub async fn add_finalizer<T: kube::Resource>(api: Api<T>, name: &str) -> Result<T, ReconcileError>
 where
-T: kube::Resource<Scope = NamespaceResourceScope>,
-<T as kube::Resource>::DynamicType: Default,
-T: Clone + DeserializeOwned + Debug + Serialize,
+    T: kube::Resource<Scope = NamespaceResourceScope>,
+    <T as kube::Resource>::DynamicType: Default,
+    T: Clone + DeserializeOwned + Debug + Serialize,
 {
-    info!("Creating {:?}", t.meta().name.as_ref().unwrap());
-    let res_api: Api<T> = Api::namespaced(client.clone(), t.meta().namespace.as_ref().unwrap());
-    let res = match res_api.create(&PostParams::default(), &t).await{
-        Ok(res) => {
-            Some(res)
-        },
-        Err(e) => {
-            if is_not_found(&e){
-                None
-            } else {
-                return Err(ReconcileError(e.into()));
-            }
-        },
-    };
-    Ok(res)
+    let finalizer: Value = json!({
+        "metadata": {
+            "finalizers": ["virt.dev/finalizer"]
+        }
+    });
+
+    let patch: Patch<&Value> = Patch::Merge(&finalizer);
+    match api.patch(name, &PatchParams::default(), &patch).await{
+       Ok(res) => {
+           Ok(res)
+       },
+       Err(e) => {
+        return Err(ReconcileError(e.into()))
+       }
+    }
 }
 
-pub async fn update_status<T: kube::Resource>(t: &T, client: Client) -> Result<Option<T>, ReconcileError>
+pub async fn del_finalizer<T: kube::Resource>(api: Api<T>, name: &str) -> Result<T, ReconcileError>
 where
-T: kube::Resource<Scope = NamespaceResourceScope>,
-<T as kube::Resource>::DynamicType: Default,
-T: Clone + DeserializeOwned + Debug + Serialize,
+    T: kube::Resource<Scope = NamespaceResourceScope>,
+    <T as kube::Resource>::DynamicType: Default,
+    T: Clone + DeserializeOwned + Debug + Serialize,
 {
-    info!("Updating Status {:?}", t.meta().name.as_ref().unwrap());
-    let patch = serde_json::to_vec(&t).unwrap();
-    let params = PostParams::default();
-    let res_api: Api<T> = Api::namespaced(client.clone(), t.meta().namespace.as_ref().unwrap());
-    let res = match res_api.replace_status(t.clone().meta().name.as_ref().unwrap(), &params, patch).await{
+    let finalizer: Value = json!({
+        "metadata": {
+            "finalizers": null
+        }
+    });
+
+    let patch: Patch<&Value> = Patch::Merge(&finalizer);
+    match api.patch(name, &PatchParams::default(), &patch).await{
         Ok(res) => {
-            Some(res)
+            Ok(res)
         },
         Err(e) => {
-            if is_not_found(&e){
-                info!("status not found: {:?}", e);
-                None
-            } else {
-                return Err(ReconcileError(e.into()));
-            }
-        },
-    };
-    Ok(res)
+         return Err(ReconcileError(e.into()))
+        }
+     }
 }
-*/
+
+pub enum ReconcileAction {
+    Create,
+    Delete,
+    NoOp,
+}
+
+pub fn reconcile_action<T: kube::Resource>(t: &T) -> ReconcileAction 
+where
+    T: kube::Resource<Scope = NamespaceResourceScope>,
+    <T as kube::Resource>::DynamicType: Default,
+    T: Clone + DeserializeOwned + Debug + Serialize,
+{
+    return if t.meta().deletion_timestamp.is_some() {
+        ReconcileAction::Delete
+    } else if t.meta().finalizers.is_none() {
+        ReconcileAction::Create
+    } else {
+        ReconcileAction::NoOp
+    };
+}
