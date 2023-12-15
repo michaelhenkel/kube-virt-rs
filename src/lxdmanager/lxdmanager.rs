@@ -1,19 +1,17 @@
-use k8s_openapi::api::core::v1::ObjectReference;
 use kube_runtime::reflector::ObjectRef;
-use tokio::process::Command;
+use serde::{Deserialize, Serialize};
+use tokio::{process::Command, io::AsyncWriteExt};
+use std::{process::{Command as StdCommand, Stdio}, io::Write};
 use anyhow::anyhow;
 use tracing::{info, warn};
-use std::{io::{self, ErrorKind}, collections::HashMap};
-use serde::{Deserialize, Serialize};
+use std::{io::{self}, collections::HashMap};
 use futures::channel::mpsc;
-//use tokio::sync::mpsc;
-use tokio_stream::{self as stream, StreamExt};
-use tokio::time::{self, Duration};
+use tokio::time::Duration;
 
-use crate::instance::instance::Instance;
+use crate::{instance::instance::{self, Instance, InstanceState, InstanceSpec}, network};
 
 pub struct LxdManager{
-	pub instance_states: HashMap<String, Option<LxdInstanceState>>,
+	pub instance_states: HashMap<String, Option<InstanceState>>,
 	pub client: LxdClient,
 	pub rx: tokio::sync::mpsc::Receiver<LxdCommand>,
 	pub update_tx: mpsc::Sender<ObjectRef<Instance>>
@@ -26,10 +24,12 @@ pub struct LxdClient{
 
 pub enum LxdCommand{
 	Create(Instance),
+	Define(InstanceConfig),
 	Delete(String),
+	DeleteInterface(Instance, String),
 	Status(
 		String,
-		tokio::sync::oneshot::Sender<Option<LxdInstanceState>>,
+		tokio::sync::oneshot::Sender<Option<InstanceState>>,
 	),
 }
 
@@ -38,6 +38,12 @@ impl LxdClient{
 		LxdClient{
 			tx
 		}
+	}
+	pub async fn define(&self, instance_config: InstanceConfig) -> anyhow::Result<()>{
+		info!("lxd client define request");
+		self.tx.send(LxdCommand::Define(instance_config)).await?;
+		info!("lxd client define request sent");
+		Ok(())
 	}
 	pub async fn create(&self, instance: Instance) -> anyhow::Result<()>{
 		info!("lxd client create request");
@@ -49,7 +55,11 @@ impl LxdClient{
 		self.tx.send(LxdCommand::Delete(name)).await?;
 		Ok(())
 	}
-	pub async fn status(&self, name: String) -> anyhow::Result<Option<LxdInstanceState>>{
+	pub async fn delete_interface(&self,instance: Instance, interface_name: String) -> anyhow::Result<()>{
+		self.tx.send(LxdCommand::DeleteInterface(instance, interface_name)).await?;
+		Ok(())
+	}
+	pub async fn status(&self, name: String) -> anyhow::Result<Option<InstanceState>>{
 		info!("lxd client status request");
 		let (tx, rx) = tokio::sync::oneshot::channel();
 		self.tx.send(LxdCommand::Status(name, tx)).await?;
@@ -71,33 +81,7 @@ impl LxdManager{
 		}
     }
 
-	pub async fn start(&mut self) -> anyhow::Result<()>{
-
-		/*
-		while let Some(cmd) = self.rx.recv().await{
-			match cmd {
-				LxdCommand::Create(instance) => {
-					info!("lxd command create");
-					self.instance_create(&instance).await?;
-				},
-				LxdCommand::Delete(name) => {
-					info!("lxd command delete");
-					self.instance_delete(&name).await?;
-				},
-				LxdCommand::Status(name, reply_tx) => {
-					info!("lxd command status");
-					let instance_state = instance_status(&name).await?;
-					if let Err(_e) = reply_tx.send(instance_state){
-						return Err(anyhow!(ErrorKind::Other));
-					}
-				}
-			}
-		}
-		Ok(())
-		*/
-		
-		let sleep = time::sleep(Duration::from_secs(20));
-		tokio::pin!(sleep);
+	pub async fn start(&mut self) -> anyhow::Result<()>{		
 		loop {
 			tokio::select! {
 				Some(cmd) = self.rx.recv() => {
@@ -113,6 +97,18 @@ impl LxdManager{
 							if let Err(e) = self.instance_delete(&name).await{
 								warn!("failed to delete instance: {:?}", e);
 							}
+						},
+						LxdCommand::Define(instance_config) => {
+							if let Err(e) = self.instance_define(instance_config).await{
+								warn!("failed to define instance: {:?}", e);
+							}
+							info!("lxd command define");
+						},
+						LxdCommand::DeleteInterface(instance, interface_name) => {
+							if let Err(e) = self.delete_interface(instance, interface_name).await{
+								warn!("failed to delete interface: {:?}", e);
+							}
+							info!("lxd command delete interface");
 						},
 						LxdCommand::Status(name, reply_tx) => {
 							info!("lxd command status");
@@ -132,7 +128,6 @@ impl LxdManager{
 				},
 				_ = async {} => {
 					tokio::time::sleep(Duration::from_secs(1)).await;
-					info!("lxd manager tick");
 					let mut existing_instances = HashMap::new();
 					let mut new_instances = HashMap::new();
 					for (instance_name, instance) in &mut self.instance_states{
@@ -159,8 +154,8 @@ impl LxdManager{
 					}
 					for (instance_name, instance_state) in existing_instances{
 						if let Some(instance) = self.instance_states.get_mut(&instance_name){
-							if instance_state.status != instance.as_ref().unwrap().status 
-							//|| instance_state.network.len() != instance.as_ref().unwrap().network.len()
+							if instance_state.status != instance.as_ref().unwrap().status
+							|| interfaces_different(instance_state.network.clone(), instance.as_ref().unwrap().network.clone())
 							{
 								info!("instance state changed");
 								let obj_ref = ObjectRef::new(&format!("{}", instance_name)).within("default");
@@ -178,18 +173,127 @@ impl LxdManager{
 						if let Err(e) = self.update_tx.clone().try_send(obj_ref){
 							warn!("failed to send instance state: {:?}", e);
 						}
-						info!("new instance sent");
 					}
 				}
 			}
-			info!("lxd manager tick end");
 		}	
 	}
 
+	pub async fn delete_interface(&mut self, instance: Instance, interface_name: String) -> anyhow::Result<()>{
+		let instance_name = instance.metadata.name.clone().unwrap();
+		let mut cmd = Command::new("lxc");
+		cmd.arg("config").
+			arg("device").
+			arg("remove").
+			arg(&instance_name).
+			arg(&interface_name);
+		let res = cmd.output().await;
+		match res {
+			Ok(res) => {
+				if !res.status.success(){
+					let stderr = std::str::from_utf8(&res.stderr).unwrap();
+					return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+				} else {
+					info!("interface removed");
+					return Ok(());
+				}
+			},
+			Err(e) => {
+				return Err(anyhow!(e));
+			}
+		}
+	}
+
+	pub async fn instance_define(&mut self, instance_config: InstanceConfig) -> anyhow::Result<()>{
+		let instance_name = instance_config.instance.metadata.name.clone().unwrap();
+		let instance_image = instance_config.instance.spec.image.clone();
+		let lxd_instance_config: LxdInstanceConfig = instance_config.clone().into();
+		let lxd_instance_config_str = serde_yaml::to_string(&lxd_instance_config)?;
+		std::fs::write(format!("/tmp/{}.yaml", instance_name), lxd_instance_config_str.clone())?;
+
+		let mut cmd = Command::new("lxc")
+        	.stdin(Stdio::piped())
+        	.stdout(Stdio::piped())
+			.arg("launch")
+			.arg(instance_image)
+			.arg(instance_name.clone())
+			.arg("--vm")
+        	.spawn()?;
+    	let mut child_stdin = cmd.stdin.take().unwrap();
+    	child_stdin.write_all(lxd_instance_config_str.as_bytes()).await?;
+		drop(child_stdin);
+		let res = cmd.wait_with_output().await;
+        match res {
+            Ok(res) => {
+                if !res.status.success(){
+                    let stderr = std::str::from_utf8(&res.stderr).unwrap();
+                    return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+                } else {
+					info!("instance successfully defined");
+					self.instance_states.insert(instance_name.clone(), None);
+                }
+            },
+            Err(e) => {
+                return Err(anyhow!(e));
+            }
+        };
+
+		/*
+
+		let cloud_init = CloudInit::from(instance_config);
+		let cloud_init_str = serde_yaml::to_string(&cloud_init)?;
+		let mut cmd = Command::new("lxc")
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.arg("config")
+			.arg("set")
+			.arg(&instance_name)
+			.arg("cloud-init.network-config")
+			.spawn()?;
+		let mut child_stdin = cmd.stdin.take().unwrap();
+		child_stdin.write_all(cloud_init_str.as_bytes()).await?;
+		drop(child_stdin);
+		let res = cmd.wait_with_output().await;
+		match res {
+			Ok(res) => {
+				if !res.status.success(){
+					let stderr = std::str::from_utf8(&res.stderr).unwrap();
+					return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+				} else {
+					info!("cloud init successfully set");
+				}
+			},
+			Err(e) => {
+				return Err(anyhow!(e));
+			}
+		};
+
+		let cmd = Command::new("lxc")
+			.arg("start")
+			.arg(&instance_name)
+			.spawn()?;
+		let res = cmd.wait_with_output().await;
+		match res {
+			Ok(res) => {
+				if !res.status.success(){
+					let stderr = std::str::from_utf8(&res.stderr).unwrap();
+					return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+				} else {
+					info!("instance successfully started");
+				}
+			},
+			Err(e) => {
+				return Err(anyhow!(e));
+			}
+		};
+		*/
+
+		Ok(())
+	}
 
     pub async fn instance_create(&mut self, instance: &Instance) -> anyhow::Result<()>{
         let mut cmd = Command::new("lxc");
-        cmd.arg("launch").
+        cmd.arg("init").
             arg(instance.spec.image.clone()).
             arg(instance.metadata.name.clone().unwrap()).
             arg("--vm").
@@ -214,7 +318,7 @@ impl LxdManager{
             }
         }
     }
-    pub async fn instance_delete(&self, name: &str) -> anyhow::Result<()>{
+    pub async fn instance_delete(&mut self, name: &str) -> anyhow::Result<()>{
         let mut cmd = Command::new("lxc");
         cmd.arg("delete").
             arg(name).
@@ -226,6 +330,7 @@ impl LxdManager{
                     let stderr = std::str::from_utf8(&res.stderr).unwrap();
                     return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
                 } else {
+					self.instance_states.remove(name);
                     return Ok(());
                 }
             },
@@ -236,7 +341,43 @@ impl LxdManager{
     }
 }
 
-pub async fn instance_status(name: &str) -> anyhow::Result<Option<LxdInstanceState>>{
+fn interfaces_different(existing_network: Option<HashMap<String, instance::InstanceInterface>>, new_network: Option<HashMap<String, instance::InstanceInterface>>) -> bool{
+	if existing_network.is_none() && new_network.is_some(){
+		return true;
+	}
+	if existing_network.is_some() && new_network.is_none(){
+		return true;
+	}
+	if existing_network.is_some() && new_network.is_some(){
+		let existing_network = existing_network.unwrap();
+		let new_network = new_network.unwrap();
+		if existing_network.len() != new_network.len(){
+			return true;
+		}
+		for (interface_name, existing_interface) in existing_network{
+			if let Some(new_interface) = new_network.get(&interface_name){
+				if existing_interface.addresses.len() != new_interface.addresses.len(){
+					return true;
+				}
+				for (i, existing_address) in existing_interface.addresses.iter().enumerate(){
+					if let Some(new_address) = new_interface.addresses.get(i){
+						if existing_address.address != new_address.address{
+							return true;
+						}
+					} else {
+						return true;
+					}
+				}
+			} else {
+				return true;
+			}
+		}
+	}
+	false	
+}
+
+
+pub async fn instance_status(name: &str) -> anyhow::Result<Option<InstanceState>>{
 	let mut cmd = Command::new("lxc");
 	cmd.arg("query").
 		arg(format!("/1.0/virtual-machines/{}/state",name));
@@ -251,8 +392,7 @@ pub async fn instance_status(name: &str) -> anyhow::Result<Option<LxdInstanceSta
 				return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
 			} else {
 				let stdout = std::str::from_utf8(&res.stdout).unwrap();
-				info!("instance state: {}", stdout);
-				let lxd_instance_state: LxdInstanceState = serde_json::from_str(stdout)?;
+				let lxd_instance_state: InstanceState = serde_json::from_str(stdout)?;
 				return Ok(Some(lxd_instance_state));
 			}
 		},
@@ -262,225 +402,231 @@ pub async fn instance_status(name: &str) -> anyhow::Result<Option<LxdInstanceSta
 	}
 }
 
-#[derive(Deserialize, Debug)]
-pub struct LxdInstanceState{
-    pub cpu: Cpu,
-    pub disk: Disk,
-    pub memory: Memory,
-    pub network: Option<HashMap<String, Interface>>,
-    pub pid: u64,
-    pub processes: u64,
-    pub status: String,
-    pub status_code: u64,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct LxdInstanceConfig{
+	config: Config,
+	devices: HashMap<String, DeviceType>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Cpu{
-    pub usage: u64,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct Config{
+	#[serde(rename = "limits.cpu")]
+	pub limits_cpu: String,
+	#[serde(rename = "limits.memory")]
+	pub limits_memory: String,
+	#[serde(rename = "cloud-init.network-config")]
+	pub cloud_init_network_config: String,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Disk{
-    pub root: Root,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum DeviceType{
+	Nic(NicConfig),
+	Disk(DiscConfig),
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Root{
-    pub total: u64,
-    pub usage: u64,
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct NicConfig{
+	#[serde(rename = "host_name")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub host_name: Option<String>,
+	#[serde(rename = "hwaddr")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub hwaddr: Option<String>,
+	#[serde(rename = "ipv4.address")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ipv4_address: Option<String>,
+	#[serde(rename = "ipv4.gateway")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ipv4_gateway: Option<String>,
+	#[serde(rename = "ipv6.gateway")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ipv6_gateway: Option<String>,
+	#[serde(rename = "mtu")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub mtu: Option<String>,
+	#[serde(rename = "name")]
+	pub name: String,
+	#[serde(rename = "network")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub network: Option<String>,
+	#[serde(rename = "nictype")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub nictype: Option<String>,
+	#[serde(rename = "type")]
+	pub r#type: String,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Memory{
-    pub swap_usage: u64,
-    pub swap_usage_peak: u64,
-    pub total: u64,
-    pub usage: u64,
-    pub usage_peak: u64,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct DiscConfig{
+	#[serde(rename = "path")]
+	pub path: String,
+	#[serde(rename = "pool")]
+	pub pool: String,
+	#[serde(rename = "type")]
+	pub r#type: String,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Network(HashMap<String, Interface>);
-
-#[derive(Deserialize, Debug)]
-pub struct Interface{
-    pub addresses: Vec<Address>,
-    pub counters: Counters,
-    pub host_name: String,
-    pub hwaddr: String,
-    pub mtu: u64,
-    pub state: String,
-    pub r#type: String,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct InstanceConfig{
+	pub instance: Instance,
+	pub interfaces: HashMap<String, InterfaceConfigType>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Address{
-    pub address: String,
-    pub family: String,
-    pub netmask: String,
-    pub scope: String,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub enum InterfaceConfigType{
+	Network{
+		ipv4: String,
+		prefix_len: u8,
+		mac: String,
+	},
+	Mgmt{
+		network: String,
+	}
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Counters{
-    pub bytes_received: u64,
-    pub bytes_sent: u64,
-    pub errors_received: u64,
-    pub errors_sent: u64,
-    pub packets_dropped_inbound: u64,
-    pub packets_dropped_outbound: u64,
-    pub packets_received: u64,
-    pub packets_sent: u64,
+impl From<InstanceConfig> for LxdInstanceConfig{
+	fn from(instance_config: InstanceConfig) -> Self {
+		let instance = instance_config.instance;
+
+		let mut device_config_map = HashMap::new();
+		let mut ethernets_config_map = HashMap::new();
+		for (idx, interface) in instance.spec.interfaces.iter().enumerate(){
+			let interface_type = match instance_config.interfaces.get(&interface.name){
+				Some(interface_type) => {
+					interface_type.clone()
+				},
+				None => {
+					warn!("interface type not found");
+					continue;
+				}
+			};
+			match interface_type{
+				InterfaceConfigType::Mgmt { network } => {
+					let nic_config = NicConfig{
+						name: interface.name.clone(),
+						r#type: "nic".to_string(),
+						network: Some(network.clone()),
+						mtu: None,
+						..Default::default()
+					};
+					let nic_device = DeviceType::Nic(nic_config);
+					device_config_map.insert(format!("eth{}",idx), nic_device);
+					let ethernet_config = CloudInitEthernet{
+						routes: None,
+						addresses: None,
+						dhcp4: Some(true),
+						dhcp_identifier: Some("mac".to_string()),
+						r#match: None,
+					};
+					ethernets_config_map.insert(interface.name.clone(), ethernet_config);
+				},
+				InterfaceConfigType::Network { ipv4, prefix_len, mac } => {
+					let nic_config = NicConfig{
+						host_name: Some(format!("{}-{}", instance.metadata.name.clone().unwrap(), interface.name.clone())),
+						hwaddr: Some(mac.clone()),
+						ipv4_address: Some(ipv4.clone()),
+						ipv4_gateway: Some("none".to_string()),
+						ipv6_gateway: Some("none".to_string()),
+						mtu: Some(format!("{}",interface.mtu.clone())),
+						name: interface.name.clone(),
+						nictype: Some("routed".to_string()),
+						r#type: "nic".to_string(),
+						network: None,
+					};
+					let nic_device = DeviceType::Nic(nic_config);
+					device_config_map.insert(format!("eth{}",idx), nic_device);
+		
+					let ethernet_config = CloudInitEthernet{
+						routes: None,
+						addresses: Some(vec![format!("{}/{}", ipv4.clone(), prefix_len)]),
+						dhcp4: None,
+						dhcp_identifier: None,
+						r#match: Some(CloudInitMatch{
+							macaddress: mac.clone(),
+						}),
+					};
+					ethernets_config_map.insert(interface.name.clone(), ethernet_config);
+				}
+			}
+		}
+
+		let root_config = DiscConfig{
+			path: "/".to_string(),
+			pool: "default".to_string(),
+			r#type: "disk".to_string(),
+		};
+		let root_device = DeviceType::Disk(root_config);
+		device_config_map.insert("root".to_string(), root_device);
+		LxdInstanceConfig{
+			config: Config{
+				limits_cpu: instance.spec.vcpu.to_string(),
+				limits_memory: instance.spec.memory.to_string(),
+				cloud_init_network_config: serde_yaml::to_string(&CloudInit{
+					network: CloudInitNetwork{
+						version: 2,
+						ethernets: ethernets_config_map,
+					}
+				}).unwrap(),
+			},
+			devices: device_config_map,
+		}
+	}
 }
-
-
 /*
-lxc query /1.0/virtual-machines/router1/state
-{
-	"cpu": {
-		"usage": 66064416000
-	},
-	"disk": {
-		"root": {
-			"total": 0,
-			"usage": 113745920
-		}
-	},
-	"memory": {
-		"swap_usage": 0,
-		"swap_usage_peak": 0,
-		"total": 15584677888,
-		"usage": 527044608,
-		"usage_peak": 0
-	},
-	"network": {
-		"enp5s0": {
-			"addresses": [
-				{
-					"address": "10.238.56.113",
-					"family": "inet",
-					"netmask": "24",
-					"scope": "global"
-				},
-				{
-					"address": "fd42:b391:ff85:63b4:216:3eff:fe24:d65c",
-					"family": "inet6",
-					"netmask": "64",
-					"scope": "global"
-				},
-				{
-					"address": "fe80::216:3eff:fe24:d65c",
-					"family": "inet6",
-					"netmask": "64",
-					"scope": "link"
-				}
-			],
-			"counters": {
-				"bytes_received": 431238,
-				"bytes_sent": 229129,
-				"errors_received": 0,
-				"errors_sent": 0,
-				"packets_dropped_inbound": 0,
-				"packets_dropped_outbound": 0,
-				"packets_received": 4101,
-				"packets_sent": 2433
-			},
-			"host_name": "tapd8fddb01",
-			"hwaddr": "00:16:3e:24:d6:5c",
-			"mtu": 1500,
-			"state": "up",
-			"type": "broadcast"
-		},
-		"enp6s0": {
-			"addresses": [],
-			"counters": {
-				"bytes_received": 0,
-				"bytes_sent": 0,
-				"errors_received": 0,
-				"errors_sent": 0,
-				"packets_dropped_inbound": 0,
-				"packets_dropped_outbound": 0,
-				"packets_received": 0,
-				"packets_sent": 0
-			},
-			"host_name": "router1_eth4",
-			"hwaddr": "50:d8:1d:63:de:e3",
-			"mtu": 1500,
-			"state": "down",
-			"type": "broadcast"
-		},
-		"enp7s0": {
-			"addresses": [],
-			"counters": {
-				"bytes_received": 0,
-				"bytes_sent": 0,
-				"errors_received": 0,
-				"errors_sent": 0,
-				"packets_dropped_inbound": 0,
-				"packets_dropped_outbound": 0,
-				"packets_received": 0,
-				"packets_sent": 0
-			},
-			"host_name": "router1_eth5",
-			"hwaddr": "92:0b:30:28:67:a1",
-			"mtu": 1500,
-			"state": "down",
-			"type": "broadcast"
-		},
-		"enp8s0": {
-			"addresses": [],
-			"counters": {
-				"bytes_received": 0,
-				"bytes_sent": 0,
-				"errors_received": 0,
-				"errors_sent": 0,
-				"packets_dropped_inbound": 0,
-				"packets_dropped_outbound": 0,
-				"packets_received": 0,
-				"packets_sent": 0
-			},
-			"host_name": "router1_eth3",
-			"hwaddr": "ca:10:e8:24:7d:f7",
-			"mtu": 1500,
-			"state": "down",
-			"type": "broadcast"
-		},
-		"lo": {
-			"addresses": [
-				{
-					"address": "127.0.0.1",
-					"family": "inet",
-					"netmask": "8",
-					"scope": "local"
-				},
-				{
-					"address": "::1",
-					"family": "inet6",
-					"netmask": "128",
-					"scope": "local"
-				}
-			],
-			"counters": {
-				"bytes_received": 46960,
-				"bytes_sent": 46960,
-				"errors_received": 0,
-				"errors_sent": 0,
-				"packets_dropped_inbound": 0,
-				"packets_dropped_outbound": 0,
-				"packets_received": 460,
-				"packets_sent": 460
-			},
-			"host_name": "",
-			"hwaddr": "",
-			"mtu": 65536,
-			"state": "up",
-			"type": "loopback"
-		}
-	},
-	"pid": 3844503,
-	"processes": 13,
-	"status": "Running",
-	"status_code": 103
-}
+network:
+  version: 2
+  ethernets:
+    enp5s0:
+      routes:
+      - to: default
+        via: 169.254.0.1
+        on-link: true
+      - to: default
+        via: fe80::1
+        on-link: true
+      addresses:
+      - 192.0.2.2/32
+      - 2001:db8::2/128
 
 */
+
+
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInit{
+	network: CloudInitNetwork,
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInitNetwork{
+	version: u8,
+	ethernets: HashMap<String, CloudInitEthernet>,
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInitEthernet{
+	#[serde(skip_serializing_if = "Option::is_none")]
+	r#match: Option<CloudInitMatch>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	routes: Option<Vec<CloudInitRoute>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	addresses: Option<Vec<String>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	dhcp4: Option<bool>,
+	#[serde(rename = "dhcp-identifier")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	dhcp_identifier: Option<String>
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInitMatch{
+	macaddress: String,
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInitRoute{
+	to: String,
+	via: String,
+	on_link: bool,
+}
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CloudInitAddress{
+	address: String,
+}

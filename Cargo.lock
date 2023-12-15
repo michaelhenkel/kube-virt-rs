@@ -824,6 +824,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tokio-stream",
  "tracing",

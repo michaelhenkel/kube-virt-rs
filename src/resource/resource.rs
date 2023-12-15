@@ -138,6 +138,54 @@ T: Clone + DeserializeOwned + Debug,
         };
         Ok(res)
     }
+
+    pub async fn patch<R: kube::Resource>(&self, t: &R) -> Result<Option<R>, ReconcileError>
+    where
+    R: kube::Resource<Scope = NamespaceResourceScope>,
+    <R as kube::Resource>::DynamicType: Default,
+    R: Clone + DeserializeOwned + Debug + Serialize,
+    {
+        let patch = Patch::Merge(&t);
+        let params = PatchParams::apply("virt.dev");
+        let res_api: Api<R> = Api::namespaced(self.client.clone(), t.meta().namespace.as_ref().unwrap());
+        let res = match res_api.patch(t.meta().name.as_ref().unwrap(), &params, &patch).await{
+            Ok(res) => {
+                Some(res)
+            },
+            Err(e) => {
+                if is_not_found(&e){
+                    None
+                } else {
+                    info!("Error updating resource: {:?}", t);
+                    return Err(ReconcileError(e.into()));
+                }
+            },
+        };
+        Ok(res)
+    }
+
+    pub async fn create_or_update<R: kube::Resource>(&self, t: &R) -> Result<Option<R>, ReconcileError>
+    where
+    R: kube::Resource<Scope = NamespaceResourceScope>,
+    <R as kube::Resource>::DynamicType: Default,
+    R: Clone + DeserializeOwned + Debug + Serialize,
+    {
+        match self.get::<R>(t.meta()).await{
+            Ok(res) => {
+                match res{
+                    Some(t) => {                    
+                        self.patch(&t).await
+                    },
+                    None => {
+                        self.create(t).await
+                    },
+                }
+            },
+            Err(e) => {
+                Err(e)
+            },
+        }
+    }
     
     pub async fn update_status<R: kube::Resource>(&self, t: &R) -> Result<Option<R>, ReconcileError>
     where
@@ -242,27 +290,25 @@ impl ResourceManager{
         let _ = crds.delete(crd_name, &dp).await.map(|res| {
             res.map_left(|o| {
                 info!(
-                    "Deleting {}: ({:?})",
-                    o.name_any(),
-                    o.status.unwrap().conditions.unwrap().last()
+                    "Deleting {})",
+                    o.name_any()
                 );
             })
             .map_right(|s| {
                 // it's gone.
-                info!("Deleted crd: ({:?})", s);
+                info!("Deleted crd");
             })
         });
         // Wait for the delete to take place (map-left case or delete from previous run)
         sleep(Duration::from_secs(1)).await;
     
         // Create the CRD so we can create Foos in kube
-        info!("Creating CRD: {}", serde_json::to_string_pretty(&crd)?);
+        info!("Creating CRD");
         let pp = PostParams::default();
         //let patch_params = PatchParams::default();
         match crds.create(&pp, &crd).await {
             Ok(o) => {
-                info!("Created {} ({:?})", o.name_any(), o.status.unwrap());
-                debug!("Created CRD: {:?}", o.spec);
+                info!("Created {}", o.name_any());
             }
             Err(kube::Error::Api(ae)) => assert_eq!(ae.code, 409), // if you skipped delete, for instance
             Err(e) => return Err(e.into()),                        // any other case is probably bad

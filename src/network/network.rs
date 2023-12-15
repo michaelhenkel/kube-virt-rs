@@ -20,7 +20,7 @@ use crate::resource::resource::Context;
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSpec {
     #[garde(skip)]
-    subnet: String
+    pub subnet: String
     
 }
 
