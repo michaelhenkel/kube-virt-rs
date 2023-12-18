@@ -29,9 +29,7 @@ async fn main() -> Result<()> {
 
     let resource_mgr = ResourceManager::new(client.clone());
 
-    resource_mgr.create(Interface::crd(), Interface::crd_name()).await?;
     resource_mgr.create(Instance::crd(), Instance::crd_name()).await?;
-    resource_mgr.create(Ipaddress::crd(), Ipaddress::crd_name()).await?;
     resource_mgr.create(Network::crd(), Network::crd_name()).await?;
 
     let mut join_list = Vec::new();
@@ -44,16 +42,7 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     }));
 
-    let resource_client: ResourceClient<Interface> = ResourceClient::new(client.clone(), None);
-    let cl = client.clone();
-    let r_m = resource_mgr.clone();
-    join_list.push(tokio::spawn(async move {
-        r_m.watch(Interface::controller(cl.clone()),Interface::reconcile, Interface::error_policy, resource_client).await?;
-        Ok::<(), anyhow::Error>(())
-    }));
-
     let (update_tx, update_rx) = mpsc::channel(0);
-
     let mut lxd_manager = LxdManager::new(update_tx.clone());
     let lxd_client = lxd_manager.client.clone();
     join_list.push(tokio::spawn(async move {
@@ -64,17 +53,8 @@ async fn main() -> Result<()> {
     let resource_client: ResourceClient<Instance> = ResourceClient::new(client.clone(), Some(lxd_client.clone()));
     let cl = client.clone();
     let r_m = resource_mgr.clone();
-    
     join_list.push(tokio::spawn(async move {
         r_m.watch(Instance::controller(cl.clone(), update_rx),Instance::reconcile, Instance::error_policy,resource_client).await?;
-        Ok::<(), anyhow::Error>(())
-    }));
-
-    let resource_client: ResourceClient<Ipaddress> = ResourceClient::new(client.clone(), None);
-    let cl = client.clone();
-    let r_m = resource_mgr.clone();
-    join_list.push(tokio::spawn(async move {
-        r_m.watch(Ipaddress::controller(cl.clone()),Ipaddress::reconcile, Ipaddress::error_policy, resource_client).await?;
         Ok::<(), anyhow::Error>(())
     }));
 

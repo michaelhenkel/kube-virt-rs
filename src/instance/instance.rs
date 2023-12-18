@@ -22,7 +22,7 @@ use crate::network::network;
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
 #[kube(group = "virt.dev", version = "v1", kind = "Instance", namespaced)]
 #[kube(status = "InstanceStatus")]
-//#[kube(printcolumn = r#"{"name":"Ip", "jsonPath": ".spec.metadata.team", "type": "string"}"#)]
+#[kube(printcolumn = r#"{"name":"Ready", "jsonPath": ".spec.status.ready", "type": "boolean"}"#)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceSpec {
     #[garde(skip)]
@@ -33,6 +33,29 @@ pub struct InstanceSpec {
     pub vcpu: i32,
     #[garde(skip)]
     pub interfaces: Vec<Interface>,
+    #[garde(skip)]
+    pub routes: Option<Vec<Route>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Route{
+    pub destination: RouteDestination,
+    pub next_hops: Vec<RouteNextHop>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDestination{
+    pub instance: String,
+    pub network: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteNextHop{
+    pub instance: String,
+    pub network: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -45,10 +68,26 @@ pub struct Interface{
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-//#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceStatus {
     state: String,
-    networks: Option<HashMap<String, InstanceInterface>>
+    networks: Option<HashMap<String, InstanceInterface>>,
+    routes: Option<Vec<RouteStatus>>,
+    ready: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteStatus{
+    destination: String,
+    next_hops: Vec<RouteNextHopStatus>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteNextHopStatus{
+    ip: String,
+    mac: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -92,19 +131,21 @@ pub struct Memory{
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 pub struct Network(HashMap<String, InstanceInterface>);
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
 pub struct InstanceInterface{
     pub addresses: Vec<Address>,
-    pub counters: Counters,
     pub host_name: String,
     pub hwaddr: String,
     pub mtu: u64,
     pub state: String,
     pub network: Option<String>,
     pub r#type: String,
+    pub host_ifidx: Option<i32>,
+    pub instance_ifidx: Option<i32>,
+    pub host_mac: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
 pub struct Address{
     pub address: String,
     pub family: String,
@@ -112,7 +153,7 @@ pub struct Address{
     pub scope: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
 pub struct Counters{
     pub bytes_received: u64,
     pub bytes_sent: u64,
@@ -155,8 +196,16 @@ impl Instance{
 
     pub async fn apply(g: Arc<Instance>, ctx: Arc<ResourceClient<Instance>>) ->  Result<Action, ReconcileError> {
         info!("reconciling instance: {:?}", g.metadata.name);
+        let mut networks_ready = false;
+        let mut routes_ready = false;
         let mut instance = match ctx.get::<Instance>(&g.metadata).await?{
-            Some(instance) => {
+            Some(mut instance) => {
+                if instance.status.is_none(){
+                    let mut instance_status = InstanceStatus::default();
+                    instance_status.ready = false;
+                    instance.status = Some(instance_status);
+                    
+                }
                 instance
             },
             None => {
@@ -176,16 +225,24 @@ impl Instance{
         };
 
         if let Some(instance_state) = instance_state{
-            instance.status = Some(InstanceStatus{
-                state: instance_state.status.clone(),
-                networks: instance_state.network.clone(),
-            });
-            ctx.update_status(&instance).await?;
+            if let Some(instance_status) = &mut instance.status{
+                let mut update = false;
+                if instance_status.state != instance_state.status{
+                    instance_status.state = instance_state.status.clone();
+                    info!("instance state changed from {:?} to {:?}", instance_status.state, instance_state.status);
+                    update = true;
+                }
+                if instance_status.networks != instance_state.network{
+                    instance_status.networks = instance_state.network.clone();
+                    info!("instance networks changed from {:?} to {:?}", instance_status.networks, instance_state.network);
+                    update = true;
+                }
+                if update{
+                    ctx.update_status(&instance).await?;
+                }
+                networks_ready = true;
+            }            
             info!("instance state: {:?}", instance_state);
-            if instance_state.status == "Running"{
-                info!("instance is running");
-                return Ok(Action::requeue(std::time::Duration::from_secs(5 * 60)))
-            }
         } else {
             info!("instance not found");
             let instance_config = match Instance::define_instance(instance.clone(), ctx.clone()).await{
@@ -200,8 +257,52 @@ impl Instance{
             if let Err(e) = ctx.lxd_client.as_ref().unwrap().define(instance_config).await{
                 warn!("failed to create instance: {:?}", e);
                 return Err(ReconcileError(e));
-            
             }
+        }
+
+        if let Some(routes) = &instance.spec.routes{
+            if instance.status.as_mut().unwrap().routes.is_none(){
+                instance.status.as_mut().unwrap().routes = Some(Vec::new());
+            }
+            let mut route_list = Vec::new();
+            for route in routes{
+                let mut route_status = RouteStatus::default();
+                route_status.destination = route.destination.instance.clone();
+                for next_hop in &route.next_hops{
+                    let mut route_next_hop_status = RouteNextHopStatus::default();
+                    let instance_metadata = ObjectMeta{
+                        name: Some(next_hop.instance.clone()),
+                        namespace: Some(instance.metadata.namespace.clone().unwrap()),
+                        ..Default::default()
+                    };
+                    let next_hop_interface = match find_instance_interface(instance_metadata.clone(), next_hop.network.clone(), ctx.clone()).await{
+                        Ok(next_hop_interface) => {
+                            next_hop_interface
+                        },
+                        Err(e) => {
+                            warn!("failed to find instance interface: {:?}", e);
+                            return Err(ReconcileError(e));
+                        }
+                    };
+
+                    route_next_hop_status.ip = next_hop_interface.addresses[0].address.clone();
+                    route_next_hop_status.mac = next_hop_interface.hwaddr.clone();
+                    route_status.next_hops.push(route_next_hop_status);
+                }
+                route_list.push(route_status);
+                
+            }
+            if route_list != instance.status.as_ref().unwrap().routes.as_ref().unwrap().clone(){
+                instance.status.as_mut().unwrap().routes = Some(route_list);
+                ctx.update_status(&instance).await?;
+            }
+            routes_ready = true;
+        } else {
+            routes_ready = true;
+        }
+        if networks_ready && routes_ready && instance.status.as_ref().unwrap().ready == false {
+            instance.status.as_mut().unwrap().ready = true;
+            ctx.update_status(&instance).await?;
         }
         Ok(Action::requeue(std::time::Duration::from_secs(5 * 60)))
     }
@@ -309,6 +410,47 @@ impl Instance{
         };
         Ok(instance_config)
     }
+}
+
+async fn find_instance_interface(instance_meta_data: ObjectMeta, network_name: String, ctx: Arc<ResourceClient<Instance>>) -> anyhow::Result<InstanceInterface> {
+    let instance = match ctx.get::<Instance>(&instance_meta_data).await?{
+        Some(instance) => {
+            instance
+        },
+        None => {
+            warn!("instance not found: {:?}", instance_meta_data);
+            return Err(anyhow::anyhow!("instance not found"));
+        }
+    };
+
+    let mut interface_name = None;
+    for interface in &instance.spec.interfaces{
+        if interface.network.name.as_ref().unwrap().to_string() == network_name{
+            interface_name = Some(interface.name.clone());
+            break;
+        }
+    }
+
+    let interface_name = if let Some(interface_name) = interface_name{
+        interface_name
+    } else {
+        warn!("interface not found: {:?}", network_name);
+        return Err(anyhow::anyhow!("interface not found"));
+    };
+
+    let instance_status = if let Some(instance_status) = &instance.status{
+        instance_status
+    } else {
+        warn!("instance status not found: {:?}", instance);
+        return Err(anyhow::anyhow!("instance status not found"));
+    };
+    let instance_interface = if let Some(instance_interface) = instance_status.networks.as_ref().unwrap().get(&interface_name){
+        instance_interface.clone()
+    } else {
+        warn!("instance interface not found: {:?}", interface_name);
+        return Err(anyhow::anyhow!("instance interface not found"));
+    };
+    Ok(instance_interface)
 }
 
 fn generate_mac_address() -> String {

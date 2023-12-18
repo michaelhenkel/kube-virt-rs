@@ -22,6 +22,29 @@ pub struct InterfaceSpec {
     pub mtu: i32,
     #[garde(skip)]
     pub network: LocalObjectReference,
+    #[garde(skip)]
+    pub routes: Option<Vec<Route>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Route{
+    pub destination: RouteDestination,
+    pub next_hops: Vec<RouteNextHop>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDestination{
+    pub instance: LocalObjectReference,
+    pub network: LocalObjectReference,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteNextHop{
+    pub instance: LocalObjectReference,
+    pub network: LocalObjectReference,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use std::{io::{self}, collections::HashMap};
 use futures::channel::mpsc;
 use tokio::time::Duration;
+use pnet;
 
 use crate::{instance::instance::{self, Instance, InstanceState, InstanceSpec}, network};
 
@@ -392,7 +393,20 @@ pub async fn instance_status(name: &str) -> anyhow::Result<Option<InstanceState>
 				return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
 			} else {
 				let stdout = std::str::from_utf8(&res.stdout).unwrap();
-				let lxd_instance_state: InstanceState = serde_json::from_str(stdout)?;
+				let mut lxd_instance_state: InstanceState = serde_json::from_str(stdout)?;
+				if let Some(networks) = &mut lxd_instance_state.network{
+					for (intf_name, instance_intf) in networks{
+						let host_intf_name = instance_intf.host_name.clone();
+						if host_intf_name == ""{
+							continue;
+						}
+						let (host_ifidx, host_mac) = get_host_interface_index_mac(&host_intf_name).await?;
+						instance_intf.host_ifidx = Some(host_ifidx);
+						instance_intf.host_mac = Some(host_mac);
+						let instance_ifidx = get_instance_interface_index(&intf_name, name).await?;
+						instance_intf.instance_ifidx = Some(instance_ifidx);
+					}
+				}
 				return Ok(Some(lxd_instance_state));
 			}
 		},
@@ -400,6 +414,42 @@ pub async fn instance_status(name: &str) -> anyhow::Result<Option<InstanceState>
 			return Err(anyhow!(e));
 		}
 	}
+}
+
+async fn get_host_interface_index_mac(interface_name: &str) -> anyhow::Result<(i32, String)>{
+	pnet::datalink::interfaces().iter().find_map(| interface| {
+		if interface.name == interface_name{
+			let mac = interface.mac.unwrap_or_default().to_string();
+			Some((interface.index as i32, mac))
+		} else {
+			None
+		}
+	}).ok_or_else(|| anyhow!("interface not found"))
+}
+
+pub async fn get_instance_interface_index(interface_name: &str, instance_name: &str) -> anyhow::Result<i32> {
+	let mut cmd = Command::new("lxc");
+	cmd.arg("exec").
+		arg(instance_name).
+		arg("cat").
+		arg(format!("/sys/class/net/{}/ifindex", interface_name));
+	let res = cmd.output().await;
+	match res {
+		Ok(res) => {
+			if !res.status.success(){
+				let stderr = std::str::from_utf8(&res.stderr).unwrap();
+				warn!("failed to get instance {} interface {} index", instance_name, interface_name);
+				return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+			} else {
+				let stdout = std::str::from_utf8(&res.stdout).unwrap();
+				let host_ifidx = stdout.trim().parse::<i32>()?;
+				return Ok(host_ifidx);
+			}
+		},
+		Err(e) => {
+			return Err(anyhow!(e));
+		}
+	}	
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
