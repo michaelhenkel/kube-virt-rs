@@ -103,6 +103,7 @@ impl Interface{
             if interface.status.as_ref().unwrap().state != interface_state{
                 info!("updating interface state {:?}",interface_state);
                 interface.status.as_mut().unwrap().state = interface_state.clone();
+
                 ctx.update_status(&interface).await?;
             }
         } else if !interface.status.as_ref().unwrap().defined{
@@ -122,7 +123,7 @@ impl Interface{
                     return Err(ReconcileError(anyhow::anyhow!("network not found")));
                 }
             };
-            let (ip, prefix_len) = if let Some(mut network_status) = network.status{
+            if let Some(mut network_status) = network.status{
                 network_status.unused.sort();
                 let ip = if let Some(mut ip_dec) = network_status.unused.pop(){
                     ip_dec += 1;
@@ -143,25 +144,25 @@ impl Interface{
                 }
                 let ip_net: ipnet::Ipv4Net = network.spec.subnet.parse().unwrap();
                 let prefix_len = ip_net.prefix_len();
-                (ip, prefix_len)
+                let interface_config = InterfaceConfig{
+                    name: interface.spec.name.clone(),
+                    mac: mac.clone(),
+                    mtu: interface.spec.mtu,
+                    ipv4: ip,
+                    prefix_len,
+                    pci_idx: interface.spec.pci_idx,
+                };
+                
+                if let Err(e) = ctx.lxd_client.as_ref().unwrap().define_interface(instance_name.clone(), interface_config).await{
+                    return Err(ReconcileError(e));
+                }
+                interface.status.as_mut().unwrap().defined = true;
+                ctx.update_status(&interface).await?;
             } else {
                 return Err(ReconcileError(anyhow::anyhow!("network status not found")));
-            };
-
-            let interface_config = InterfaceConfig{
-                name: interface.spec.name.clone(),
-                mac: mac.clone(),
-                mtu: interface.spec.mtu,
-                ipv4: ip,
-                prefix_len,
-                pci_idx: interface.spec.pci_idx,
-            };
-            
-            if let Err(e) = ctx.lxd_client.as_ref().unwrap().define_interface(instance_name.clone(), interface_config).await{
-                return Err(ReconcileError(e));
             }
-            interface.status.as_mut().unwrap().defined = true;
-            ctx.update_status(&interface).await?;
+
+
         }
 
         Ok(Action::requeue(Duration::from_secs(5 * 300)))
@@ -170,16 +171,12 @@ impl Interface{
 
     pub async fn cleanup(g: Arc<Interface>, ctx: Arc<ResourceClient<Interface>>) ->  Result<Action, ReconcileError> {      
         info!("cleaning up Interface: {:?}", g.metadata.name);
-        if let Err(e) = ctx.lxd_client.as_ref().unwrap().delete(g.metadata.name.clone().unwrap()).await{
-            warn!("failed to delete Interface: {:?}", e);
-            return Err(ReconcileError(e));
-        }
-        return Ok(Action::requeue(std::time::Duration::from_secs(5 * 60)))
+        return Ok(Action::await_change())
     }
 
     pub fn error_policy(_g: Arc<Interface>, error: &ReconcileError, _ctx: Arc<ResourceClient<Interface>>) -> Action {
         warn!("reconcile failed: {:?}", error);
-        Action::requeue(Duration::from_secs(5 * 60))
+        Action::requeue(Duration::from_secs(1))
     }
 }
 

@@ -1,3 +1,4 @@
+use garde::error;
 use kube_runtime::reflector::ObjectRef;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, io::AsyncWriteExt, sync::RwLock};
@@ -23,7 +24,6 @@ pub struct LxdManager{
 	pub instance_update_tx: mpsc::Sender<ObjectRef<Instance>>,
 	pub interface_update_tx: mpsc::Sender<ObjectRef<Interface>>,
 	pub lxd_monitor_client: LxdMonitorClient,
-	pub instance_create_queue: VecDeque<Instance>,
 }
 
 #[derive(Clone)]
@@ -32,10 +32,23 @@ pub struct LxdClient{
 }
 
 pub enum LxdCommand{
-	Define(Instance),
-	Start(Instance),
-	DefineInterface(String, InterfaceConfig),
-	Delete(String),
+	Define(
+		Instance,
+		tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+	),
+	Start(
+		Instance,
+		tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+	),
+	DefineInterface(
+		String,
+		InterfaceConfig,
+		tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+	),
+	Delete(
+		String,
+		tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+	),
 	DeleteInterface(Instance, String),
 	Status(
 		String,
@@ -56,27 +69,67 @@ impl LxdClient{
 	}
 	pub async fn define(&self, instance: Instance) -> anyhow::Result<()>{
 		info!("lxd client define request");
-		self.tx.send(LxdCommand::Define(instance)).await?;
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.tx.send(LxdCommand::Define(instance, tx)).await?;
 		info!("lxd client define request sent");
-		Ok(())
+		match rx.await{
+			Ok(res) => {
+				info!("lxd client define request received");
+				res
+			},
+			Err(e) => {
+				warn!("lxd client define request received");
+				Err(anyhow!(e))
+			}
+		}
 	}
 
 	pub async fn start(&self, instance: Instance) -> anyhow::Result<()>{
 		info!("lxd client start request");
-		self.tx.send(LxdCommand::Start(instance)).await?;
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.tx.send(LxdCommand::Start(instance, tx)).await?;
 		info!("lxd client start request sent");
-		Ok(())
+		match rx.await{
+			Ok(res) => {
+				info!("lxd client start request received");
+				res
+			},
+			Err(e) => {
+				warn!("lxd client start request received");
+				Err(anyhow!(e))
+			}
+		}
 	}
 
 	pub async fn define_interface(&self, instance_name: String, interface_config: InterfaceConfig) -> anyhow::Result<()>{
 		info!("lxd client define interface request");
-		self.tx.send(LxdCommand::DefineInterface(instance_name, interface_config)).await?;
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.tx.send(LxdCommand::DefineInterface(instance_name, interface_config, tx)).await?;
 		info!("lxd client define interface request sent");
-		Ok(())
+		match rx.await{
+			Ok(res) => {
+				info!("lxd client define interface request received");
+				res
+			},
+			Err(e) => {
+				warn!("lxd client define interface request received");
+				Err(anyhow!(e))
+			}
+		}
 	}
 	pub async fn delete(&self, name: String) -> anyhow::Result<()>{
-		self.tx.send(LxdCommand::Delete(name)).await?;
-		Ok(())
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.tx.send(LxdCommand::Delete(name, tx)).await?;
+		match rx.await{
+			Ok(res) => {
+				info!("lxd client delete request received");
+				res
+			},
+			Err(e) => {
+				warn!("lxd client delete request received");
+				Err(anyhow!(e))
+			}
+		}
 	}
 	pub async fn delete_interface(&self,instance: Instance, interface_name: String) -> anyhow::Result<()>{
 		self.tx.send(LxdCommand::DeleteInterface(instance, interface_name)).await?;
@@ -114,62 +167,79 @@ impl LxdManager{
 			instance_update_tx,
 			interface_update_tx,
 			lxd_monitor_client,
-			instance_create_queue: VecDeque::new(),
 		}
     }
 
 	pub async fn start(&mut self) -> anyhow::Result<()>{
 		let mut interval = tokio::time::interval(Duration::from_secs(1));
-		let mut instance_create_interval = tokio::time::interval(Duration::from_millis(1500));
+		let now = tokio::time::Instant::now();
 		loop {
 			tokio::select! {
 				Some(cmd) = self.rx.recv() => {
 					match cmd {
-						LxdCommand::Delete(name) => {
+						LxdCommand::Delete(name, tx) => {
 							info!("lxd command delete");
-							if let Err(e) = self.instance_delete(&name).await{
-								warn!("failed to delete instance: {:?}", e);
-							} else {
-								if let Err(e) = self.lxd_monitor_client.delete_instance(name).await{
-									error!("failed to delete instance from lxd monitor: {:?}", e);
-								}
-							}
-						},
-						LxdCommand::Start(instance_config) => {
-							self.instance_create_queue.push_back(instance_config.clone());
-							info!("lxd command start");
-						},
-						LxdCommand::Define(instance_config) => {
-							if let Err(e) = self.instance_define(instance_config.clone()).await{
-								warn!("failed to define instance: {:?}", e);
-							} else {
-								if let Err(e) = self.lxd_monitor_client.add_instance(instance_config.metadata.name.clone().unwrap()).await{
-									error!("failed to add instance to lxd monitor: {:?}", e);
-								}
-							}
-							info!("lxd command define");
-						},
-						LxdCommand::DefineInterface(instance_name, interface_config) => {
-							if let Err(e) = self.interface_define(instance_name.clone(), interface_config.clone()).await{
-								warn!("failed to define interface: {:?}", e);
-							}
-							/*
-							if let Ok(instance_state) = self.lxd_monitor_client.get_state(instance_name.clone()).await{
-								if let Some(instance_state) = instance_state {
-									if instance_state.status == "Stopped" {
-										if let Err(e) = self.interface_define(instance_name.clone(), interface_config.clone()).await{
-											warn!("failed to define interface: {:?}", e);
-										}
+							match self.instance_delete(&name, now).await{
+								Ok(_) => {
+									info!("lxd command delete success");
+									if let Err(e) = self.lxd_monitor_client.delete_instance(name.clone()).await{
+										error!("failed to delete instance from monitor: {:?}", e);
+									}
+									self.instance_states.remove(&name);
+									if let Err(e) = tx.send(Ok(())){
+										warn!("failed to send delete reply: {:?}", e);
+									}
+								},
+								Err(e) => {
+									error!("lxd command delete failed: {:?}", e);
+									if let Err(e) = tx.send(Err(e)){
+										warn!("failed to send delete reply: {:?}", e);
 									}
 								}
 							}
-							*/
 
+						},
+						LxdCommand::Start(instance_config, tx) => {
+							let res = self.instance_start(instance_config.clone(), now).await;
+							if let Err(e) = tx.send(res){
+								warn!("failed to send start reply: {:?}", e);
+							}
+							info!("lxd command start");
+
+						},
+						LxdCommand::Define(instance_config, tx) => {
+							info!("lxd command define cmd received at {} for {}", now.elapsed().as_millis(), instance_config.metadata.name.clone().unwrap());
+							match self.instance_define(instance_config.clone(), now).await{
+								Ok(_) => {
+									info!("lxd command define success");
+									self.instance_states.insert(instance_config.metadata.name.clone().unwrap(), None);
+									if let Err(e) = self.lxd_monitor_client.add_instance(instance_config.metadata.name.clone().unwrap()).await{
+										error!("failed add instance to monitor: {:?}", e);
+									}
+									if let Err(e) = tx.send(Ok(())){
+										warn!("failed to send define reply: {:?}", e);
+									}
+								},
+								Err(e) => {
+									error!("lxd command define failed: {:?}", e);
+									if let Err(e) = tx.send(Err(e)){
+										warn!("failed to send define reply: {:?}", e);
+									}
+								}
+							}
+						},
+						LxdCommand::DefineInterface(instance_name, interface_config, tx) => {
+							info!("lxd command interface define cmd received at {} for {}/{}", now.elapsed().as_millis(), instance_name, interface_config.name);
+							let res = self.interface_define(instance_name.clone(), interface_config.clone(), now).await;
+							if let Err(e) = tx.send(res){
+								warn!("failed to send interface define reply: {:?}", e);
+							}
 							info!("lxd command interface define");
 						},
 						LxdCommand::DeleteInterface(instance, interface_name) => {
-							if let Err(e) = self.delete_interface(instance, interface_name).await{
-								warn!("failed to delete interface: {:?}", e);
+							let res = self.delete_interface(instance, interface_name, now).await;
+							if let Err(e) = res{
+								error!("failed to delete interface: {:?}", e);
 							}
 							info!("lxd command delete interface");
 						},
@@ -201,6 +271,7 @@ impl LxdManager{
 						}
 					}
 				},
+
 				_ = interval.tick() => {
 					for (instance_name, instance_state) in &mut self.instance_states{
 						if let Ok(new_instance_state) = self.lxd_monitor_client.get_instance_state(instance_name).await{
@@ -227,30 +298,32 @@ impl LxdManager{
 						}
 					}
 				},
-				_ = instance_create_interval.tick() => {
-					if let Some(instance_config) = self.instance_create_queue.pop_front(){
-						let mut push_front = true;
-						if let Ok(instance_state) = self.lxd_monitor_client.get_state(instance_config.metadata.name.clone().unwrap()).await{
-							if let Some(instance_state) = instance_state {
-								if instance_state.status == "Running" {
-									push_front = false;
-								} else if instance_state.status == "Stopped" {
-									if let Err(e) = self.instance_start(instance_config.clone()).await{
-										warn!("failed to start instance: {:?}", e);
-									}
-								}
-							}
-						}
-						if push_front{
-							self.instance_create_queue.push_front(instance_config.clone());
-						}
-					}
-				},
 			}
 		}	
 	}
 
-	pub async fn delete_interface(&mut self, instance: Instance, interface_name: String) -> anyhow::Result<()>{
+	pub async fn run_cmd(&mut self, mut cmd: Command, now: tokio::time::Instant) -> anyhow::Result<()>{
+		let res = cmd.output().await;
+		match res {
+			Ok(res) => {
+				if !res.status.success(){
+					let stderr = std::str::from_utf8(&res.stderr).unwrap();
+					error!("failed to execute command: {:?}", stderr);
+					return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
+				} else {
+					info!("command executed successfully at {}\n{:?}", now.elapsed().as_millis(), cmd);
+				}
+			},
+			Err(e) => {
+				error!("failed to execute command: {:?}", e);
+				return Err(anyhow!(e));
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		Ok(())
+	}
+
+	pub async fn delete_interface(&mut self, instance: Instance, interface_name: String, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let instance_name = instance.metadata.name.clone().unwrap();
 		let mut cmd = Command::new("lxc");
 		cmd.arg("config").
@@ -258,25 +331,10 @@ impl LxdManager{
 			arg("remove").
 			arg(&instance_name).
 			arg(&interface_name);
-		let res = cmd.output().await;
-		match res {
-			Ok(res) => {
-				if !res.status.success(){
-					let stderr = std::str::from_utf8(&res.stderr).unwrap();
-					return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
-				} else {
-					info!("interface removed");
-					return Ok(());
-				}
-			},
-			Err(e) => {
-				return Err(anyhow!(e));
-			}
-		}
+		self.run_cmd(cmd, now).await
 	}
 
-	pub async fn instance_define(&mut self, instance: Instance) -> anyhow::Result<()>{
-		let instance_name = instance.metadata.name.clone().unwrap();
+	pub async fn instance_define(&mut self, instance: Instance, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let mut cmd = Command::new("lxc");
         cmd.arg("init").
             arg(instance.spec.image.clone()).
@@ -286,52 +344,17 @@ impl LxdManager{
             arg(format!("limits.cpu={}", instance.spec.vcpu)).
             arg("-c").
             arg(format!("limits.memory={}", instance.spec.memory));
-
-		let res = cmd.output().await;
-        match res {
-            Ok(res) => {
-                if !res.status.success(){
-                    let stderr = std::str::from_utf8(&res.stderr).unwrap();
-                    return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
-                } else {
-					info!("instance successfully defined");
-					self.instance_states.insert(instance_name.clone(), None);
-                }
-            },
-            Err(e) => {
-                return Err(anyhow!(e));
-            }
-        };
-
-		Ok(())
+		self.run_cmd(cmd, now).await
 	}
 
-	pub async fn instance_start(&mut self, instance: Instance) -> anyhow::Result<()>{
-		let instance_name = instance.metadata.name.clone().unwrap();
+	pub async fn instance_start(&mut self, instance: Instance, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let mut cmd = Command::new("lxc");
         cmd.arg("start").
             arg(instance.metadata.name.clone().unwrap());
-
-		let res = cmd.output().await;
-        match res {
-            Ok(res) => {
-                if !res.status.success(){
-                    let stderr = std::str::from_utf8(&res.stderr).unwrap();
-                    return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
-                } else {
-					info!("instance successfully started");
-					self.instance_states.insert(instance_name.clone(), None);
-                }
-            },
-            Err(e) => {
-                return Err(anyhow!(e));
-            }
-        };
-
-		Ok(())
+		self.run_cmd(cmd, now).await
 	}
 
-	pub async fn interface_define(&mut self, instance_name: String, interface_config: InterfaceConfig) -> anyhow::Result<()>{
+	pub async fn interface_define(&mut self, instance_name: String, interface_config: InterfaceConfig, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let mut cmd = Command::new("lxc");
 		cmd.arg("config")
 			.arg("device")
@@ -346,47 +369,15 @@ impl LxdManager{
 			.arg(format!("hwaddr={}", interface_config.mac))
 			.arg(format!("name={}", interface_config.name))
 			.arg(format!("host_name={}-{}",instance_name, interface_config.name));
-		info!("interface add cmd: \n{:?}", cmd);
-		let res = cmd.output().await;
-        match res {
-            Ok(res) => {
-                if !res.status.success(){
-                    let stderr = std::str::from_utf8(&res.stderr).unwrap();
-					warn!("failed to define interface: {:?}", stderr);
-                    return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
-                } else {
-					info!("instance {} interface {} successfully defined", instance_name, interface_config.name);
-					self.interface_states.insert((instance_name, interface_config.name), None);
-                }
-            },
-            Err(e) => {
-                return Err(anyhow!(e));
-            }
-        };
-
-		Ok(())
+		self.run_cmd(cmd, now).await
 	}
 
-    pub async fn instance_delete(&mut self, name: &str) -> anyhow::Result<()>{
+    pub async fn instance_delete(&mut self, name: &str, now: tokio::time::Instant) -> anyhow::Result<()>{
         let mut cmd = Command::new("lxc");
         cmd.arg("delete").
             arg(name).
             arg("--force");
-        let res = cmd.output().await;
-        match res {
-            Ok(res) => {
-                if !res.status.success(){
-                    let stderr = std::str::from_utf8(&res.stderr).unwrap();
-                    return Err(io::Error::new(io::ErrorKind::Other, stderr).into());
-                } else {
-					self.instance_states.remove(name);
-                    return Ok(());
-                }
-            },
-            Err(e) => {
-                return Err(anyhow!(e));
-            }
-        }
+		self.run_cmd(cmd, now).await
     }
 }
 
@@ -472,45 +463,6 @@ pub struct InterfaceConfig{
 }
 
 
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInit{
-	network: CloudInitNetwork,
-}
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInitNetwork{
-	version: u8,
-	ethernets: HashMap<String, CloudInitEthernet>,
-}
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInitEthernet{
-	#[serde(skip_serializing_if = "Option::is_none")]
-	r#match: Option<CloudInitMatch>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	routes: Option<Vec<CloudInitRoute>>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	addresses: Option<Vec<String>>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	dhcp4: Option<bool>,
-	#[serde(rename = "dhcp-identifier")]
-	#[serde(skip_serializing_if = "Option::is_none")]
-	dhcp_identifier: Option<String>
-}
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInitMatch{
-	macaddress: String,
-}
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInitRoute{
-	to: String,
-	via: String,
-	on_link: bool,
-}
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct CloudInitAddress{
-	address: String,
-}
-
 pub struct LxdMonitor{
 	states: HashMap<String, InstanceState>,
 	rx: tokio::sync::mpsc::Receiver<LxdMonitorCommand>,
@@ -572,7 +524,7 @@ pub enum LxdMonitorCommand{
 
 impl LxdMonitor {
 	pub fn new() -> LxdMonitor{
-		let (tx, rx) = tokio::sync::mpsc::channel(1000);
+		let (tx, rx) = tokio::sync::mpsc::channel(1);
 		LxdMonitor{
 			states: HashMap::new(),
 			rx,
@@ -612,8 +564,8 @@ impl LxdMonitor {
 						LxdMonitorCommand::GetInterfaceState(instance_name, interface_name, reply_tx) => {
 							let mut instance_interface_state = None;
 							if let Some(instance_state) = self.states.get(&instance_name).cloned(){
-								if let Some(network) = instance_state.network{
-									if let Some(interface_state) = network.get(&interface_name){
+								if let Some(device) = instance_state.devices{
+									if let Some(interface_state) = device.get(&interface_name){
 										instance_interface_state = Some(interface_state.clone());
 									}
 								}

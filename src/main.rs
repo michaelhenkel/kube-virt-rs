@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     }));
 
-    let (instance_update_tx, instance_update_rx) = mpsc::channel(1000);
-    let (interface_update_tx, interface_update_rx) = mpsc::channel(1000);
+    let (instance_update_tx, instance_update_rx) = mpsc::channel(1);
+    let (interface_update_tx, interface_update_rx) = mpsc::channel(1);
     
     let mut lxd_manager = LxdManager::new(instance_update_tx.clone(), interface_update_tx.clone(), lxd_monitor_client.clone());
     let lxd_client = lxd_manager.client.clone();

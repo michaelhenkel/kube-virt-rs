@@ -96,15 +96,9 @@ pub struct RouteNextHopStatus{
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 pub struct InstanceState{
-    pub cpu: Cpu,
-    pub disk: Disk,
-    pub memory: Memory,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<HashMap<String, InstanceInterface>>,
-    pub pid: u64,
-    pub processes: i64,
+    pub devices: Option<HashMap<String, InstanceInterface>>,
     pub status: String,
-    pub status_code: u64,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -184,11 +178,6 @@ impl Instance{
                         if owner_ref.kind == "Instance"{
                             if let Some(labels) = &interface.metadata.labels{
                                 if let Some(instance_name) = labels.get("virt.dev/instance"){
-                                    let instance_metadata = ObjectMeta{
-                                        name: Some(instance_name.clone()),
-                                        namespace: Some(interface.metadata.namespace.clone().unwrap()),
-                                        ..Default::default()
-                                    };
                                     let object_ref = ObjectRef::new(instance_name).within(&interface.metadata.namespace.clone().unwrap());
                                     object_list.push(object_ref);
                                 }
@@ -211,7 +200,7 @@ impl Instance{
             warn!("failed to delete instance: {:?}", e);
             return Err(ReconcileError(e));
         }
-        return Ok(Action::requeue(std::time::Duration::from_secs(5 * 60)))
+        return Ok(Action::await_change())
     }
 
     pub async fn apply(g: Arc<Instance>, ctx: Arc<ResourceClient<Instance>>) ->  Result<Action, ReconcileError> {
@@ -255,7 +244,7 @@ impl Instance{
                     }
                 }
             }            
-        } else {
+        } else if instance.status.as_ref().unwrap().phase == "Created".to_string(){
             info!("instance not found");
             if let Err(e) = ctx.lxd_client.as_ref().unwrap().define(instance.clone()).await{
                 warn!("failed to create instance: {:?}", e);
@@ -326,17 +315,27 @@ impl Instance{
                             all_interfaces_defined = false;
                             break;
                         }
+                    } else {
+                        all_interfaces_defined = false;
+                        break;
                     }
+                } else {
+                    all_interfaces_defined = false;
+                    break;
                 }
             }
             if all_interfaces_defined{
-                info!("all interfaces defined, starting instance");
+                info!("all interfaces defined, starting instance: {}", instance.metadata.name.as_ref().unwrap().clone());
+                info!("phase/status {}/{}", instance.status.as_ref().unwrap().phase, instance.status.as_ref().unwrap().state);
                 if let Err(e) = ctx.lxd_client.as_ref().unwrap().start(instance.clone()).await{
                     warn!("failed to start instance: {:?}", e);
                     return Err(ReconcileError(e));
                 }
                 instance.status.as_mut().unwrap().phase = "Started".to_string();
                 ctx.update_status(&instance).await?;
+            } else {
+                info!("not all interfaces defined, waiting");
+                return Ok(Action::requeue(std::time::Duration::from_secs(2)));
             }
         }
         Ok(Action::requeue(std::time::Duration::from_secs(5 * 300)))
