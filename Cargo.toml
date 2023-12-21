@@ -24,3 +24,5 @@ tokio-stream = { version = "0.1.14", features = ["full"] }
 kube-runtime = { version = "0.87.1", features = ["unstable-runtime-reconcile-on"] }
 serde_yaml = "0.9.27"
 pnet = { version = "0.34.0", features = ["serde"] }
+rtnetlink = "0.14.0"
+netlink-packet-route = "0.18.1"

@@ -1,4 +1,5 @@
 use core::future::IntoFuture;
+use std::collections::BTreeMap;
 use futures::Future;
 use futures::StreamExt;
 use futures::TryFuture;
@@ -92,6 +93,36 @@ T: Clone + DeserializeOwned + Debug,
             lxd_client,
         }
     }
+
+    pub async fn list<R: kube::Resource>(&self, namespace: &str, labels: Option<BTreeMap<String, String>>) -> Result<Option<ObjectList<R>>, ReconcileError>
+    where
+    R: kube::Resource<Scope = NamespaceResourceScope>,
+    <R as kube::Resource>::DynamicType: Default,
+    R: Clone + DeserializeOwned + Debug,
+    {
+        let res_api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        let mut list_params = ListParams::default();
+        if let Some(labels) = labels{
+            for (k, v) in labels.iter(){
+                list_params.label_selector = Some(format!("{}={}", k, v));
+            }
+        }
+        let res = match res_api.list(&list_params).await{
+            Ok(res) => {
+                Some(res)
+            },
+            Err(e) => {
+                if is_not_found(&e){
+                    None
+                } else {
+                    return Err(ReconcileError(e.into()));
+                }
+            },
+        };
+        Ok(res)
+    }
+
+
     pub async fn get<R: kube::Resource>(&self, metadata: &ObjectMeta) -> Result<Option<R>, ReconcileError>
     where
         R: kube::Resource<Scope = NamespaceResourceScope>,
