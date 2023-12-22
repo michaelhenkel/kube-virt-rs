@@ -11,7 +11,7 @@ use tokio::time::Duration;
 use pnet;
 
 use crate::{
-	instance::instance::{self, Instance, InstanceState, InstanceSpec, InstanceInterface},
+	instance::instance::{self, Instance, InstanceState, InstanceSpec, InstanceInterface, InstanceConfig},
 	interface::interface::Interface,
 	network
 };
@@ -274,7 +274,7 @@ impl LxdManager{
 
 				_ = interval.tick() => {
 					for (instance_name, instance_state) in &mut self.instance_states{
-						if let Ok(new_instance_state) = self.lxd_monitor_client.get_instance_state(instance_name).await{
+						if let Ok(new_instance_state) = self.lxd_monitor_client.get_instance_config(instance_name).await{
 							if instance_state.as_ref() != new_instance_state.as_ref(){
 								info!("instance state changed for instance {} : {:?}",instance_name, new_instance_state);
 								*instance_state = new_instance_state;
@@ -286,7 +286,7 @@ impl LxdManager{
 						}
 					}
 					for ((instance_name, interface_name), interface_state) in &mut self.interface_states{
-						if let Ok(new_interface_state) = self.lxd_monitor_client.get_interface_state(instance_name.clone(), interface_name.clone()).await{
+						if let Ok(new_interface_state) = self.lxd_monitor_client.get_interface_config(instance_name.clone(), interface_name.clone()).await{
 							if interface_state.as_ref() != new_interface_state.as_ref(){
 								info!("interface state changed for instance {} interface {} : {:?}",instance_name, interface_name, new_interface_state);
 								*interface_state = new_interface_state;
@@ -465,6 +465,7 @@ pub struct InterfaceConfig{
 
 pub struct LxdMonitor{
 	states: HashMap<String, InstanceState>,
+	configs: HashMap<String, InstanceConfig>,
 	rx: tokio::sync::mpsc::Receiver<LxdMonitorCommand>,
 	pub client: LxdMonitorClient,
 }
@@ -475,16 +476,16 @@ pub struct LxdMonitorClient{
 }
 
 impl LxdMonitorClient{
-	pub async fn get_instance_state(&self, instance_name: &str) -> anyhow::Result<Option<String>>{
+	pub async fn get_instance_config(&self, instance_name: &str) -> anyhow::Result<Option<String>>{
 		let (tx, rx) = tokio::sync::oneshot::channel();
-		self.tx.send(LxdMonitorCommand::GetInstanceState(instance_name.to_string(), tx)).await?;
+		self.tx.send(LxdMonitorCommand::GetInstanceConfig(instance_name.to_string(), tx)).await?;
 		let instance_state = rx.await?;
 		Ok(instance_state)
 	}
 
-	pub async fn get_interface_state(&self, instance_name: String, interface_name: String) -> anyhow::Result<Option<InstanceInterface>>{
+	pub async fn get_interface_config(&self, instance_name: String, interface_name: String) -> anyhow::Result<Option<InstanceInterface>>{
 		let (tx, rx) = tokio::sync::oneshot::channel();
-		self.tx.send(LxdMonitorCommand::GetInterfaceState(instance_name, interface_name, tx)).await?;
+		self.tx.send(LxdMonitorCommand::GetInterfaceConfig(instance_name, interface_name, tx)).await?;
 		let interface_state = rx.await?;
 		Ok(interface_state)
 	}
@@ -515,9 +516,9 @@ impl LxdMonitorClient{
 }
 
 pub enum LxdMonitorCommand{
-	GetInstanceState(String, tokio::sync::oneshot::Sender<Option<String>>),
+	GetInstanceConfig(String, tokio::sync::oneshot::Sender<Option<String>>),
 	GetState(String, tokio::sync::oneshot::Sender<Option<InstanceState>>),
-	GetInterfaceState(String, String, tokio::sync::oneshot::Sender<Option<InstanceInterface>>),
+	GetInterfaceConfig(String, String, tokio::sync::oneshot::Sender<Option<InstanceInterface>>),
 	AddInstance(String),
 	DeleteInstance(String),
 }
@@ -527,12 +528,14 @@ impl LxdMonitor {
 		let (tx, rx) = tokio::sync::mpsc::channel(1);
 		LxdMonitor{
 			states: HashMap::new(),
+			configs: HashMap::new(),
 			rx,
 			client: LxdMonitorClient { tx }
 		}
 	}
 	pub async fn run(&mut self) -> anyhow::Result<()>{
-		let mut interval = tokio::time::interval(Duration::from_secs(1));
+		let mut config_interval = tokio::time::interval(Duration::from_secs(1));
+		let mut state_interval = tokio::time::interval(Duration::from_secs(1));
 		loop {
 			tokio::select! {
 				Some(cmd) = self.rx.recv() => {
@@ -551,37 +554,42 @@ impl LxdMonitor {
 								warn!("failed to send instance state");
 							}
 						},
-						LxdMonitorCommand::GetInstanceState(instance_name, reply_tx) => {
-							let instance_state = self.states.get(&instance_name).cloned();
-							let mut state = None;
-							if let Some(instance_state) = instance_state{
-								state = Some(instance_state.status);
+						LxdMonitorCommand::GetInstanceConfig(instance_name, reply_tx) => {
+							let instance_config = self.configs.get(&instance_name).cloned();
+							let mut config = None;
+							if let Some(instance_config) = instance_config{
+								config = Some(instance_config.status);
 							}
-							if let Err(_e) = reply_tx.send(state){
-								warn!("failed to send instance state");
+							if let Err(_e) = reply_tx.send(config){
+								warn!("failed to send instance config");
 							}
 						},
-						LxdMonitorCommand::GetInterfaceState(instance_name, interface_name, reply_tx) => {
-							let mut instance_interface_state = None;
-							if let Some(instance_state) = self.states.get(&instance_name).cloned(){
-								if let Some(device) = instance_state.devices{
-									if let Some(interface_state) = device.get(&interface_name){
-										instance_interface_state = Some(interface_state.clone());
+						LxdMonitorCommand::GetInterfaceConfig(instance_name, interface_name, reply_tx) => {
+							let mut instance_interface_config = None;
+							if let Some(instance_config) = self.configs.get(&instance_name).cloned(){
+								if let Some(devices) = instance_config.devices{
+									for (_, device_config) in &devices{
+										if let Some(device_name) = &device_config.name{
+											if device_name.clone() == interface_name{
+												instance_interface_config = Some(device_config.clone());
+												break;
+											}
+										}
 									}
 								}
 							}
-							if let Err(_e) = reply_tx.send(instance_interface_state){
-								warn!("failed to send interface state");
+							if let Err(_e) = reply_tx.send(instance_interface_config){
+								warn!("failed to send interface config");
 							}
 						}
 
 					}
 				},
-				_ = interval.tick() => {
-					for (instance_name, instance_state) in &mut self.states{
+				_ = config_interval.tick() => {
+					for (instance_name, instance_config) in &mut self.configs{
 						let mut cmd = Command::new("lxc");
 						cmd.arg("query").
-							arg(format!("/1.0/virtual-machines/{}/state",instance_name));
+							arg(format!("/1.0/virtual-machines/{}",instance_name));
 						let res = cmd.output().await;
 						match res {
 							Ok(res) => {
@@ -590,8 +598,8 @@ impl LxdMonitor {
 									warn!("failed to get instance state: {:?}", stderr);
 								} else {
 									let stdout = std::str::from_utf8(&res.stdout).unwrap();
-									let lxd_instance_state: InstanceState = serde_json::from_str(stdout)?;
-									*instance_state = lxd_instance_state;
+									let lxd_instance_config: InstanceConfig = serde_json::from_str(stdout)?;
+									*instance_config = lxd_instance_config;
 								}
 							},
 							Err(e) => {

@@ -95,9 +95,16 @@ pub struct RouteNextHopStatus{
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-pub struct InstanceState{
+pub struct InstanceConfig{
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<HashMap<String, InstanceInterface>>,
+    pub status: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct InstanceState{
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<HashMap<String, InstanceInterface>>,
     pub status: String,
 }
 
@@ -141,6 +148,7 @@ pub struct InstanceInterface{
     pub host_ifidx: Option<i32>,
     pub instance_ifidx: Option<i32>,
     pub host_mac: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
@@ -197,6 +205,10 @@ impl Instance{
     pub async fn cleanup(g: Arc<Instance>, ctx: Arc<ResourceClient<Instance>>) ->  Result<Action, ReconcileError> {      
         info!("cleaning up Instance: {:?}", g.metadata.name);
         if let Err(e) = ctx.lxd_client.as_ref().unwrap().delete(g.metadata.name.clone().unwrap()).await{
+            if e.to_string().contains("Instance not found"){
+                info!("Instance not found");
+                return Ok(Action::await_change())
+            }
             warn!("failed to delete instance: {:?}", e);
             return Err(ReconcileError(e));
         }
