@@ -95,10 +95,16 @@ pub struct RouteNextHopStatus{
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-pub struct InstanceState{
+pub struct InstanceConfig{
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<HashMap<String, InstanceInterface>>,
     pub status: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct InstanceState{
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<HashMap<String, InstanceInterface>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

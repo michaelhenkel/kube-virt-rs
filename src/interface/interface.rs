@@ -90,21 +90,43 @@ impl Interface{
             }
         };
 
-        let interface_state =  match ctx.lxd_client.as_ref().unwrap().interface_status(instance_name.clone(), interface.spec.name.clone()).await{
-            Ok(interface_state) => interface_state,
+        /*
+        let interface_state_status =  match ctx.lxd_client.as_ref().unwrap().interface_state_status(instance_name.clone(), interface.spec.name.clone()).await{
+            Ok(interface_state_status) => interface_state_status,
             Err(e) => {
                 warn!("failed to get interface state: {:?}", e);
                 return Err(ReconcileError(anyhow::anyhow!("failed to get interface state: {:?}", e)));
             }
         };
 
-        if let Some(interface_state) = interface_state{
+        if let Some(interface_state_status) = interface_state_status{
             info!("interface state found for {}", name);
-            if interface.status.as_ref().unwrap().state != interface_state{
-                info!("updating interface state {:?}",interface_state);
-                interface.status.as_mut().unwrap().state = interface_state.clone();
+            if interface.status.as_ref().unwrap().state != interface_state_status{
+                info!("updating interface state {:?}",interface_state_status);
+                interface.status.as_mut().unwrap().state = interface_state_status.clone();
+                if let Some(res) = ctx.update_status(&interface).await?{
+                    interface = res;
+                }
+            }
+        }
+        */
 
-                ctx.update_status(&interface).await?;
+        let interface_config_status =  match ctx.lxd_client.as_ref().unwrap().interface_config_status(instance_name.clone(), interface.spec.name.clone()).await{
+            Ok(interface_config_status) => interface_config_status,
+            Err(e) => {
+                warn!("failed to get interface config: {:?}", e);
+                return Err(ReconcileError(anyhow::anyhow!("failed to get interface config: {:?}", e)));
+            }
+        };
+
+        if let Some(interface_config_status) = interface_config_status{
+            info!("interface config found for {}: {:?}", name, interface_config_status);
+            if interface.status.as_ref().unwrap().state != interface_config_status{
+                info!("updating interface state {:?}",interface_config_status);
+                interface.status.as_mut().unwrap().state = interface_config_status.clone();
+                if let Some(res) = ctx.update_status(&interface).await?{
+                    interface = res;
+                }
             }
         } else if !interface.status.as_ref().unwrap().defined{
             info!("interface state not found for {}, creating interface", name);
@@ -161,10 +183,7 @@ impl Interface{
             } else {
                 return Err(ReconcileError(anyhow::anyhow!("network status not found")));
             }
-
-
         }
-
         Ok(Action::requeue(Duration::from_secs(5 * 300)))
     }
 
