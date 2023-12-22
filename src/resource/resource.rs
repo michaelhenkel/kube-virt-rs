@@ -1,4 +1,3 @@
-use core::future::IntoFuture;
 use std::collections::BTreeMap;
 use futures::Future;
 use futures::StreamExt;
@@ -20,20 +19,11 @@ use kube::{Client, Api, api::DeleteParams};
 use kube::{
     Error,
     ResourceExt,
-    runtime::{
-        watcher, 
-        WatchStreamExt,
-        controller::{Action, Controller},
-        watcher::Config,
-        reflector::ObjectRef,
-    }
+    runtime::controller::{Action, Controller},
 };
 use serde_json::Value;
 use kube::api::{Patch, PatchParams, ListParams, ObjectList};
-use async_trait::async_trait;
-
 use tracing::*;
-use futures::stream::TryStreamExt;
 use kube_runtime::finalizer::{self, finalizer, Event};
 use crate::lxdmanager::lxdmanager::LxdClient;
 
@@ -134,7 +124,6 @@ T: Clone + DeserializeOwned + Debug,
         let res_api: Api<R> = Api::namespaced(self.client.clone(), namespace);
         let res = match res_api.get(name).await{
             Ok(res) => {
-                info!("Found resource: {:?}", res.meta().name.as_ref().unwrap());
                 Some(res)
             },
             Err(e) => {
@@ -153,7 +142,6 @@ T: Clone + DeserializeOwned + Debug,
         <R as kube::Resource>::DynamicType: Default,
         R: Clone + DeserializeOwned + Debug,
     {
-        info!("Creating {:?}", t.meta().name.as_ref().unwrap());
         let res_api: Api<R> = Api::namespaced(self.client.clone(), t.meta().namespace.as_ref().unwrap());
         let res = match res_api.create(&PostParams::default(), &t).await{
             Ok(res) => {
@@ -187,7 +175,7 @@ T: Clone + DeserializeOwned + Debug,
                 if is_not_found(&e){
                     None
                 } else {
-                    info!("Error updating resource: {:?}", t);
+                    warn!("Error updating resource: {:?}", t);
                     return Err(ReconcileError(e.into()));
                 }
             },
@@ -224,7 +212,6 @@ T: Clone + DeserializeOwned + Debug,
         <R as kube::Resource>::DynamicType: Default,
         R: Clone + DeserializeOwned + Debug + Serialize,
     {
-        info!("Updating Status {:?}", t.meta().name.as_ref().unwrap());
         let patch = serde_json::to_vec(&t).unwrap();
         let params = PostParams::default();
         let res_api: Api<R> = Api::namespaced(self.client.clone(), t.meta().namespace.as_ref().unwrap());
@@ -234,7 +221,6 @@ T: Clone + DeserializeOwned + Debug,
             },
             Err(e) => {
                 if is_not_found(&e){
-                    info!("status not found: {:?}", e);
                     None
                 } else {
                     return Err(ReconcileError(e.into()));
@@ -325,7 +311,7 @@ impl ResourceManager{
                     o.name_any()
                 );
             })
-            .map_right(|s| {
+            .map_right(|_s| {
                 // it's gone.
                 info!("Deleted crd");
             })
@@ -371,7 +357,7 @@ impl ResourceManager{
             run(reconciler, error_policy, Arc::new(resource_client))
             .for_each(|res| async move {
                 match res {
-                    Ok(o) => info!("reconciled {:?}", o),
+                    Ok(_o) => {},
                     Err(e) => warn!("reconcile failed: {:?}", e),
                 }
             })
@@ -383,13 +369,6 @@ impl ResourceManager{
 
 }
 
-/*
-            K: Resource + Clone + DeserializeOwned + Serialize + Debug,
-            ReconcileFut: TryFuture<Ok = Result<Action, ReconcileFut::Error>>,
-            ReconcileFut::Error: StdError + 'static,
-
-*/
-
 pub fn is_not_found(e: &Error) -> bool {
     match e{
         kube::Error::Api(ae) => {
@@ -397,16 +376,12 @@ pub fn is_not_found(e: &Error) -> bool {
                 kube::error::ErrorResponse { status: _, message: _, reason: r, code: _ } => {
                     match r.as_str(){
                         "NotFound" => {
-                            info!("Resource not found: {:?}", e);
                             return true
                         },
                         _ => {
                             return false
                         },
                     }
-                },
-                _ => {
-                    return false
                 },
             }
         },

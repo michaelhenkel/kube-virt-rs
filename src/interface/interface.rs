@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 use kube_runtime::reflector::ObjectRef;
 use rand::Rng;
-use k8s_openapi::{chrono::Local, api::core::v1::LocalObjectReference, apimachinery::pkg::apis::meta::v1::OwnerReference};
+use k8s_openapi::api::core::v1::LocalObjectReference;
 use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client, core::ObjectMeta, Resource};
 use serde::{Deserialize, Serialize};
 use garde::Validate;
@@ -10,7 +10,12 @@ use futures::channel::mpsc;
 use tracing::{warn, info};
 use futures::stream::StreamExt;
 
-use crate::{instance::instance::{Instance, InstanceInterface}, resource::resource::{ReconcileError, ResourceClient}, network::network::{Network, self}, ipaddress::{ipaddress::{Ipaddress, IpaddressSpec}, self}, lxdmanager::lxdmanager::InterfaceConfig};
+use crate::{
+    instance::instance::{Instance, InstanceInterface},
+    resource::resource::{ReconcileError, ResourceClient},
+    network::network,
+    lxdmanager::lxdmanager::InterfaceConfig
+};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
 #[kube(group = "virt.dev", version = "v1", kind = "Interface", namespaced)]
@@ -45,7 +50,7 @@ impl Interface{
         .watches(
             Api::<Instance>::all(client),
             Config::default(),
-            |object| {
+            |_object| {
                 let object_list = Vec::new();
                 object_list.into_iter()
             }
@@ -66,8 +71,6 @@ impl Interface{
                 return Ok(Action::await_change());
             }
         };
-        let name = interface.metadata.name.clone().unwrap();
-        let namespace = interface.metadata.namespace.clone().unwrap();
 
         if interface.status.is_none(){
             interface.status = Some(InterfaceStatus::default());
@@ -90,24 +93,48 @@ impl Interface{
             }
         };
 
-        let interface_state =  match ctx.lxd_client.as_ref().unwrap().interface_status(instance_name.clone(), interface.spec.name.clone()).await{
-            Ok(interface_state) => interface_state,
+        let _interface_config =  match ctx.lxd_client.as_ref().unwrap().interface_config(instance_name.clone(), interface.spec.name.clone()).await{
+            Ok(interface_config) => interface_config,
             Err(e) => {
-                warn!("failed to get interface state: {:?}", e);
-                return Err(ReconcileError(anyhow::anyhow!("failed to get interface state: {:?}", e)));
+                warn!("failed to get interface config: {:?}", e);
+                return Err(ReconcileError(anyhow::anyhow!("failed to get interface config: {:?}", e)));
             }
         };
 
-        if let Some(interface_state) = interface_state{
-            info!("interface state found for {}", name);
+        let interface_state =  match ctx.lxd_client.as_ref().unwrap().interface_state(instance_name.clone(), interface.spec.name.clone()).await{
+            Ok(interface_config) => interface_config,
+            Err(e) => {
+                warn!("failed to get interface config: {:?}", e);
+                return Err(ReconcileError(anyhow::anyhow!("failed to get interface config: {:?}", e)));
+            }
+        };
+
+        if let Some(mut interface_state) = interface_state{
+            let idx = match ctx.lxd_client.as_ref().unwrap().get_instance_interface_index(interface.spec.name.as_str(), &instance_name).await{
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!("failed to get interface index: {:?}", e);
+                    return Err(ReconcileError(anyhow::anyhow!("failed to get interface index: {:?}", e)));
+                }
+            };
+            interface_state.instance_ifidx = Some(idx);
+
+            let (host_ifidx, host_mac) = match ctx.lxd_client.as_ref().unwrap().get_host_interface_index_mac(interface.meta().name.as_ref().unwrap()).await{
+                Ok((host_ifidx, host_mac)) => (host_ifidx, host_mac),
+                Err(e) => {
+                    warn!("failed to get host interface index: {:?}", e);
+                    return Err(ReconcileError(anyhow::anyhow!("failed to get host interface index: {:?}", e)));
+                }
+            };
+            interface_state.host_ifidx = Some(host_ifidx);
+            interface_state.host_mac = Some(host_mac);
+
             if interface.status.as_ref().unwrap().state != interface_state{
-                info!("updating interface state {:?}",interface_state);
                 interface.status.as_mut().unwrap().state = interface_state.clone();
 
                 ctx.update_status(&interface).await?;
             }
         } else if !interface.status.as_ref().unwrap().defined{
-            info!("interface state not found for {}, creating interface", name);
             let mac = generate_mac_address();
             let network_metadata = ObjectMeta{
                 name: interface.spec.network.name.clone(),
@@ -169,8 +196,7 @@ impl Interface{
     }
 
 
-    pub async fn cleanup(g: Arc<Interface>, ctx: Arc<ResourceClient<Interface>>) ->  Result<Action, ReconcileError> {      
-        info!("cleaning up Interface: {:?}", g.metadata.name);
+    pub async fn cleanup(_g: Arc<Interface>, _ctx: Arc<ResourceClient<Interface>>) ->  Result<Action, ReconcileError> {      
         return Ok(Action::await_change())
     }
 

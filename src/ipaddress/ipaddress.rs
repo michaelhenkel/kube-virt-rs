@@ -5,16 +5,14 @@ use kube::{
     CustomResource,
     runtime::{Controller, watcher::Config, controller::Action},
     Api,
-    client, core::{Object, ObjectMeta}
+    client, core::ObjectMeta
 };
 use serde::{Deserialize, Serialize};
 use garde::Validate;
 use schemars::JsonSchema;
 use tracing::warn;
-use ipnet;
+use crate::{resource::resource::{ReconcileError, ResourceClient}, network::network::Network};
 
-use crate::{resource::resource::{ReconcileError, ResourceClient}, interface::interface::InterfaceSpec, network::network::Network};
-use crate::resource::resource::Context;
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
 #[kube(group = "virt.dev", version = "v1", kind = "Ipaddress", namespaced)]
@@ -39,7 +37,7 @@ impl Ipaddress{
         .watches(
             Api::<Ipaddress>::all(client),
             Config::default(),
-            |object| {
+            |_object| {
                 let object_list = Vec::new();
                 object_list.into_iter()
             }

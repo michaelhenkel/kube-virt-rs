@@ -1,19 +1,14 @@
-use std::{sync::Arc, time::Duration, collections::{BTreeMap, HashMap}, os::fd::AsRawFd};
+use std::{sync::Arc, time::Duration, collections::HashMap};
 
 use anyhow::anyhow;
-use futures::TryStreamExt;
-use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client, Client};
+use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client};
 use serde::{Deserialize, Serialize};
 use garde::Validate;
 use schemars::JsonSchema;
 use tracing::{warn, info};
 use ipnet;
-use kube_runtime::{finalizer, reflector::ObjectRef};
 use rtnetlink::{NetworkNamespace, new_connection};
-
-
-use crate::{instance::instance::{Instance, InstanceInterface}, resource::resource::{ReconcileError, ResourceClient}};
-use crate::resource::resource::Context;
+use crate::{instance::instance::InstanceInterface, resource::resource::{ReconcileError, ResourceClient}};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
 #[kube(group = "virt.dev", version = "v1", kind = "Network", namespaced)]
@@ -23,7 +18,6 @@ use crate::resource::resource::Context;
 pub struct NetworkSpec {
     #[garde(skip)]
     pub subnet: String
-    
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -67,7 +61,7 @@ impl Network{
         Ok(Action::await_change())
     }
     
-    pub async fn cleanup(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {
+    pub async fn cleanup(g: Arc<Network>, _ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {
         if std::path::Path::new(&format!("/var/run/netns/{}", g.metadata.name.as_ref().unwrap().clone())).exists(){
             match NetworkNamespace::del(g.metadata.name.as_ref().unwrap().clone()).await.map_err(|e| ReconcileError(anyhow!("failed to create namespace: {:?}", e))){
                 Ok(_) => {
@@ -77,17 +71,11 @@ impl Network{
                     warn!("failed to delete namespace: {:?}", e);
                 }
             }
-
-            info!("namespace already exists");
-        } else {
-            info!("creating namespace");
         }
-        info!("cleaning up network: {:?}", g.metadata.name);
         Ok(Action::await_change())
     }
 
     pub async fn apply(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {      
-        info!("reconciling network: {:?}", g.metadata.name);
         let mut network = match ctx.get::<Network>(&g.metadata).await?{
             Some(network) => {
                 network
@@ -109,9 +97,7 @@ impl Network{
             status.last_ip = gateway;
             status.unused = Vec::new();
             network.status = Some(status);
-            if let Some(res) = ctx.update_status(&network).await?{
-                network = res;
-            }
+            ctx.update_status(&network).await?;
         }
 
         /*

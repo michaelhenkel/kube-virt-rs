@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::{sync::Arc, time::Duration, collections::HashMap, any};
-use k8s_openapi::{chrono::Local, api::core::v1::LocalObjectReference};
+use std::{sync::Arc, time::Duration, collections::HashMap};
+use k8s_openapi::api::core::v1::LocalObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     CustomResource,
@@ -9,7 +9,6 @@ use kube::{
     client, core::ObjectMeta
 };
 use kube_runtime::reflector::ObjectRef;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use garde::Validate;
 use schemars::JsonSchema;
@@ -17,8 +16,7 @@ use tracing::{warn, info};
 use futures::channel::mpsc;
 use futures::stream::StreamExt;
 use crate::interface::interface;
-use crate::{resource::resource::{ReconcileError, ResourceClient}, instance, lxdmanager::lxdmanager};
-//use crate::lxdmanager::lxdmanager::InstanceConfig;
+use crate::resource::resource::{ReconcileError, ResourceClient};
 use crate::network::network;
 
 
@@ -95,9 +93,16 @@ pub struct RouteNextHopStatus{
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-pub struct InstanceState{
+pub struct InstanceConfig{
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<HashMap<String, InstanceInterface>>,
+    pub status: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct InstanceState{
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<HashMap<String, InstanceInterface>>,
     pub status: String,
 }
 
@@ -131,16 +136,17 @@ pub struct Network(HashMap<String, InstanceInterface>);
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
 pub struct InstanceInterface{
-    pub addresses: Vec<Address>,
+    pub addresses: Option<Vec<Address>>,
     pub host_name: String,
     pub hwaddr: String,
-    pub mtu: u64,
-    pub state: String,
+    pub mtu: Option<u64>,
+    pub state: Option<String>,
     pub network: Option<String>,
     pub r#type: String,
     pub host_ifidx: Option<i32>,
     pub instance_ifidx: Option<i32>,
     pub host_mac: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema, PartialEq)]
@@ -237,7 +243,6 @@ impl Instance{
         if let Some(instance_state) = instance_state{
             if let Some(instance_status) = &mut instance.status{
                 if instance_status.state != instance_state{
-                    info!("instance state changed from {:?} to {:?}", instance_status.state, instance_state);
                     instance_status.state = instance_state.clone();
                     if let Some(res) = ctx.update_status(&instance).await?{
                         instance = res;
@@ -245,7 +250,6 @@ impl Instance{
                 }
             }            
         } else if instance.status.as_ref().unwrap().phase == "Created".to_string(){
-            info!("instance not found");
             if let Err(e) = ctx.lxd_client.as_ref().unwrap().define(instance.clone()).await{
                 warn!("failed to create instance: {:?}", e);
                 return Err(ReconcileError(e));
@@ -325,8 +329,6 @@ impl Instance{
                 }
             }
             if all_interfaces_defined{
-                info!("all interfaces defined, starting instance: {}", instance.metadata.name.as_ref().unwrap().clone());
-                info!("phase/status {}/{}", instance.status.as_ref().unwrap().phase, instance.status.as_ref().unwrap().state);
                 if let Err(e) = ctx.lxd_client.as_ref().unwrap().start(instance.clone()).await{
                     warn!("failed to start instance: {:?}", e);
                     return Err(ReconcileError(e));
@@ -334,7 +336,6 @@ impl Instance{
                 instance.status.as_mut().unwrap().phase = "Started".to_string();
                 ctx.update_status(&instance).await?;
             } else {
-                info!("not all interfaces defined, waiting");
                 return Ok(Action::requeue(std::time::Duration::from_secs(2)));
             }
         }
@@ -345,7 +346,7 @@ impl Instance{
         Action::requeue(Duration::from_secs(5))
     }
 
-    async fn release_ip(ctx: Arc<ResourceClient<Instance>>, ip: String, network: String, namespace: &String) -> anyhow::Result<()> {
+    async fn _release_ip(ctx: Arc<ResourceClient<Instance>>, ip: String, network: String, namespace: &String) -> anyhow::Result<()> {
         let network_metadata = ObjectMeta{
             name: Some(network),
             namespace: Some(namespace.clone()),
