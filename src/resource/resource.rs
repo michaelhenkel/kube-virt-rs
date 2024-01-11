@@ -93,9 +93,16 @@ T: Clone + DeserializeOwned + Debug,
         let res_api: Api<R> = Api::namespaced(self.client.clone(), namespace);
         let mut list_params = ListParams::default();
         if let Some(labels) = labels{
-            for (k, v) in labels.iter(){
-                list_params.label_selector = Some(format!("{}={}", k, v));
+            let mut label_selector = String::new();
+            for (idx, (k, v)) in labels.iter().enumerate(){
+                if idx + 1 < labels.len(){
+                    label_selector.push_str(&format!("{}={},", k, v ));
+                } else {
+                    label_selector.push_str(&format!("{}={}", k, v));
+                }
             }
+            info!("label_selector: {}", label_selector);
+            list_params.label_selector = Some(label_selector);
         }
         let res = match res_api.list(&list_params).await{
             Ok(res) => {

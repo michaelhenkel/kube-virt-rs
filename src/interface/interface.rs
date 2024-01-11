@@ -38,8 +38,11 @@ pub struct InterfaceSpec {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InterfaceStatus {
-    state: InstanceInterface,
+    pub state: InstanceInterface,
     pub defined: bool,
+    pub prefix: String,
+    pub prefix_len: u8,
+    pub gateway: Option<String>,
 }
 
 impl Interface{
@@ -111,7 +114,10 @@ impl Interface{
 
         if let Some(mut interface_state) = interface_state{
             let idx = match ctx.lxd_client.as_ref().unwrap().get_instance_interface_index(interface.spec.name.as_str(), &instance_name).await{
-                Ok(idx) => idx,
+                Ok(idx) => {
+                    info!("interface index: {:?}", idx);
+                    idx
+                },
                 Err(e) => {
                     warn!("failed to get interface index: {:?}", e);
                     return Err(ReconcileError(anyhow::anyhow!("failed to get interface index: {:?}", e)));
@@ -175,7 +181,7 @@ impl Interface{
                     name: interface.spec.name.clone(),
                     mac: mac.clone(),
                     mtu: interface.spec.mtu,
-                    ipv4: ip,
+                    ipv4: ip.clone(),
                     prefix_len,
                     pci_idx: interface.spec.pci_idx,
                 };
@@ -184,12 +190,16 @@ impl Interface{
                     return Err(ReconcileError(e));
                 }
                 interface.status.as_mut().unwrap().defined = true;
+                interface.status.as_mut().unwrap().prefix = ip;
+                interface.status.as_mut().unwrap().prefix_len = prefix_len;
+                if let Some(status) = network.status{
+                    interface.status.as_mut().unwrap().gateway = Some(status.gateway);
+                }
+
                 ctx.update_status(&interface).await?;
             } else {
                 return Err(ReconcileError(anyhow::anyhow!("network status not found")));
             }
-
-
         }
 
         Ok(Action::requeue(Duration::from_secs(5 * 300)))

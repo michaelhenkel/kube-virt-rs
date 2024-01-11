@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::{sync::Arc, time::Duration, collections::HashMap};
 use k8s_openapi::api::core::v1::LocalObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -15,9 +14,8 @@ use schemars::JsonSchema;
 use tracing::{warn, info};
 use futures::channel::mpsc;
 use futures::stream::StreamExt;
-use crate::interface::interface;
+use crate::flowtable::flowtable;
 use crate::resource::resource::{ReconcileError, ResourceClient};
-use crate::network::network;
 
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
@@ -32,8 +30,6 @@ pub struct InstanceSpec {
     pub image: String,
     #[garde(skip)]
     pub vcpu: i32,
-    #[garde(skip)]
-    pub interfaces: Vec<Interface>,
     #[garde(skip)]
     pub routes: Option<Vec<Route>>,
 }
@@ -174,26 +170,6 @@ impl Instance{
         let api = Api::<Instance>::default_namespaced(client.clone());
         Controller::new(api, Config::default())
         .reconcile_on(update_rx.map(|x| (x)))
-        .watches(
-            Api::<interface::Interface>::all(client),
-            Config::default(),
-            |interface| {
-                let mut object_list = Vec::new();
-                if let Some(owner_ref) = &interface.metadata.owner_references{
-                    for owner_ref in owner_ref{
-                        if owner_ref.kind == "Instance"{
-                            if let Some(labels) = &interface.metadata.labels{
-                                if let Some(instance_name) = labels.get("virt.dev/instance"){
-                                    let object_ref = ObjectRef::new(instance_name).within(&interface.metadata.namespace.clone().unwrap());
-                                    object_list.push(object_ref);
-                                }
-                            }
-                        }
-                    }
-                }
-                object_list.into_iter()
-            }
-        )
     }
 
     pub async fn reconcile(g: Arc<Instance>, ctx: Arc<ResourceClient<Instance>>) ->  Result<Action, ReconcileError> {        
@@ -230,6 +206,34 @@ impl Instance{
             }
         };
 
+         
+        match ctx.get::<flowtable::Flowtable>(&g.metadata).await?{
+            Some(_) => {},
+            None => {
+                let flow_table = flowtable::Flowtable{
+                    metadata: ObjectMeta{
+                        name: instance.metadata.name.clone(),
+                        namespace: instance.metadata.namespace.clone(),
+                        owner_references: Some(vec![
+                            OwnerReference{
+                                api_version: "virt.dev/v1".to_string(),
+                                kind: "Instance".to_string(),
+                                name: instance.metadata.name.as_ref().unwrap().clone(),
+                                uid: instance.metadata.uid.as_ref().unwrap().clone(),
+                                ..Default::default()
+                            }
+                        ]),
+                        ..Default::default()
+                    }, 
+                    spec: flowtable::FlowtableSpec{
+                        flow_table_type: flowtable::FlowTableType::Instance,
+                    },
+                    status: None,
+                };
+                ctx.create(&flow_table).await?;
+            }
+        }
+
         let instance_state = match ctx.lxd_client.as_ref().unwrap().status(instance.metadata.name.clone().unwrap()).await{
             Ok(instance_state) => {
                 instance_state
@@ -244,135 +248,26 @@ impl Instance{
             if let Some(instance_status) = &mut instance.status{
                 if instance_status.state != instance_state{
                     instance_status.state = instance_state.clone();
-                    if let Some(res) = ctx.update_status(&instance).await?{
-                        instance = res;
+                    if instance_state == "Running"{
+                        instance_status.ready = true;
+                    } else {
+                        instance_status.ready = false;
                     }
+                    ctx.update_status(&instance).await?;
                 }
             }            
-        } else if instance.status.as_ref().unwrap().phase == "Created".to_string(){
+        } else{
             if let Err(e) = ctx.lxd_client.as_ref().unwrap().define(instance.clone()).await{
                 warn!("failed to create instance: {:?}", e);
                 return Err(ReconcileError(e));
             }
             instance.status.as_mut().unwrap().phase = "Defined".to_string();
-            if let Some(res) = ctx.update_status(&instance).await?{
-                instance = res;
-            }
-            for (idx, intf) in instance.spec.interfaces.iter().enumerate(){
-                let intf_meta = ObjectMeta{
-                    name: Some(format!("{}-{}", instance.metadata.name.as_ref().unwrap().clone(),intf.name.clone())),
-                    namespace: Some(instance.metadata.namespace.clone().unwrap()),
-                    owner_references: Some(vec![
-                        OwnerReference{
-                            api_version: "virt.dev/v1".to_string(),
-                            kind: "Instance".to_string(),
-                            name: instance.metadata.name.as_ref().unwrap().clone(),
-                            uid: instance.metadata.uid.as_ref().unwrap().clone(),
-                            ..Default::default()
-                        }
-                    ]),
-                    labels: Some(BTreeMap::from([(
-                        "virt.dev/instance".to_string(),
-                        instance.metadata.name.as_ref().unwrap().clone(),
-
-                    )])),
-                    ..Default::default()
-                };
-                let res = ctx.get::<interface::Interface>(&intf_meta).await?;
-                if res.is_none(){
-                    let intf = interface::Interface{
-                        metadata: intf_meta,
-                        spec: interface::InterfaceSpec{
-                            name: intf.name.clone(),
-                            network: intf.network.clone(),
-                            mtu: intf.mtu,
-                            mgmt: intf.mgmt,
-                            pci_idx: idx as u32,
-                        },
-                        status: None,
-                    };
-                    ctx.create(&intf).await?;
-                }
-            }
-        }
-
-        if instance.status.as_ref().unwrap().state == "Stopped".to_string() && instance.status.as_ref().unwrap().phase == "Defined".to_string(){
-            let mut all_interfaces_defined = true;
-            for intf in &instance.spec.interfaces{
-                let intf_meta = ObjectMeta{
-                    name: Some(format!("{}-{}", instance.metadata.name.as_ref().unwrap().clone(),intf.name.clone())),
-                    namespace: Some(instance.metadata.namespace.clone().unwrap()),
-                    owner_references: Some(vec![
-                        OwnerReference{
-                            api_version: "virt.dev/v1".to_string(),
-                            kind: "Instance".to_string(),
-                            name: instance.metadata.name.as_ref().unwrap().clone(),
-                            uid: instance.metadata.uid.as_ref().unwrap().clone(),
-                            ..Default::default()
-                        }
-                    ]),
-                    ..Default::default()
-                };
-                if let Some(intf) = ctx.get::<interface::Interface>(&intf_meta).await?{
-                    if let Some(intf_status) = intf.status{
-                        if !intf_status.defined{
-                            all_interfaces_defined = false;
-                            break;
-                        }
-                    } else {
-                        all_interfaces_defined = false;
-                        break;
-                    }
-                } else {
-                    all_interfaces_defined = false;
-                    break;
-                }
-            }
-            if all_interfaces_defined{
-                if let Err(e) = ctx.lxd_client.as_ref().unwrap().start(instance.clone()).await{
-                    warn!("failed to start instance: {:?}", e);
-                    return Err(ReconcileError(e));
-                }
-                instance.status.as_mut().unwrap().phase = "Started".to_string();
-                ctx.update_status(&instance).await?;
-            } else {
-                return Ok(Action::requeue(std::time::Duration::from_secs(2)));
-            }
+            ctx.update_status(&instance).await?;
         }
         Ok(Action::requeue(std::time::Duration::from_secs(5 * 300)))
     }
     pub fn error_policy(_g: Arc<Instance>, error: &ReconcileError, _ctx: Arc<ResourceClient<Instance>>) -> Action {
         warn!("reconcile failed: {:?}", error);
         Action::requeue(Duration::from_secs(5))
-    }
-
-    async fn _release_ip(ctx: Arc<ResourceClient<Instance>>, ip: String, network: String, namespace: &String) -> anyhow::Result<()> {
-        let network_metadata = ObjectMeta{
-            name: Some(network),
-            namespace: Some(namespace.clone()),
-            ..Default::default()
-        };
-        let mut network = match ctx.get::<network::Network>(&network_metadata).await?{
-            Some(network) => {
-                network
-            },
-            None => {
-                warn!("network not found: {:?}", network_metadata);
-                return Ok(());
-            }
-        };
-        if let Some(mut network_status) = network.status{
-            network_status.unused.sort();
-            let ip: std::net::Ipv4Addr = ip.parse()?;
-            let ip_dec = u32::from(ip);
-            network_status.unused.push(ip_dec);
-            network.status = Some(network_status);
-            if let Err(e) = ctx.update_status(&network).await{
-                return Err(anyhow::anyhow!("failed to update network status: {:?}", e));
-            }
-        } else {
-            return Err(anyhow::anyhow!("network status not found"));
-        }
-        Ok(())
     }
 }

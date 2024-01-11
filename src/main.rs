@@ -1,11 +1,14 @@
 pub mod interface;
 pub mod instance;
-pub mod ipaddress;
+pub mod flowtable;
 pub mod network;
 pub mod resource;
+pub mod link;
 pub mod lxdmanager;
 use lxdmanager::lxdmanager::{LxdManager, LxdMonitor};
 use network::network::Network;
+use link::link::Link;
+use flowtable::flowtable::Flowtable;
 use resource::resource::{ResourceManager, ResourceClient};
 use interface::interface::Interface;
 use instance::instance::Instance;
@@ -29,6 +32,8 @@ async fn main() -> Result<()> {
     resource_mgr.create(Network::crd(), Network::crd_name()).await?;
     resource_mgr.create(Instance::crd(), Instance::crd_name()).await?;
     resource_mgr.create(Interface::crd(), Interface::crd_name()).await?;
+    resource_mgr.create(Flowtable::crd(), Flowtable::crd_name()).await?;
+    resource_mgr.create(Link::crd(), Link::crd_name()).await?;
 
     let mut join_list = Vec::new();
 
@@ -37,6 +42,22 @@ async fn main() -> Result<()> {
     let r_m = resource_mgr.clone();
     join_list.push(tokio::spawn(async move {
         r_m.watch(Network::controller(cl.clone()),Network::reconcile, Network::error_policy, resource_client).await?;
+        Ok::<(), anyhow::Error>(())
+    }));
+
+    let resource_client: ResourceClient<Flowtable> = ResourceClient::new(client.clone(), None);
+    let cl = client.clone();
+    let r_m = resource_mgr.clone();
+    join_list.push(tokio::spawn(async move {
+        r_m.watch(Flowtable::controller(cl.clone()),Flowtable::reconcile, Flowtable::error_policy, resource_client).await?;
+        Ok::<(), anyhow::Error>(())
+    }));
+
+    let resource_client: ResourceClient<Link> = ResourceClient::new(client.clone(), None);
+    let cl = client.clone();
+    let r_m = resource_mgr.clone();
+    join_list.push(tokio::spawn(async move {
+        r_m.watch(Link::controller(cl.clone()),Link::reconcile, Link::error_policy, resource_client).await?;
         Ok::<(), anyhow::Error>(())
     }));
 

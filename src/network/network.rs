@@ -1,14 +1,19 @@
-use std::{sync::Arc, time::Duration, collections::HashMap};
+use std::{sync::Arc, time::Duration, collections::{HashMap, BTreeMap}};
 
 use anyhow::anyhow;
-use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client};
+use k8s_openapi::{apimachinery::pkg::apis::meta::v1::OwnerReference, api::core::v1::LocalObjectReference};
+use kube::{CustomResource, runtime::{Controller, watcher::Config, controller::Action}, Api, client, core::ObjectMeta};
+use kube_runtime::reflector::ObjectRef;
 use serde::{Deserialize, Serialize};
 use garde::Validate;
 use schemars::JsonSchema;
 use tracing::{warn, info};
 use ipnet;
 use rtnetlink::{NetworkNamespace, new_connection};
-use crate::{instance::instance::InstanceInterface, resource::resource::{ReconcileError, ResourceClient}};
+use crate::{
+    instance::instance::InstanceInterface,
+    resource::resource::{ReconcileError, ResourceClient}, interface::{interface::Interface, self}, flowtable::flowtable
+};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
 #[kube(group = "virt.dev", version = "v1", kind = "Network", namespaced)]
@@ -34,26 +39,20 @@ impl Network{
     pub fn controller(client: client::Client) -> Controller<Network> {
         let api = Api::<Network>::all(client.clone());
         Controller::new(api, Config::default())
-        /*
         .watches(
-            Api::<Instance>::all(client),
+            Api::<Interface>::all(client),
             Config::default(),
             |object| {
                 let mut object_list = Vec::new();
-                /* 
-                for instance_interface in object.spec.interfaces.iter(){
-                    if instance_interface.mgmt.is_some() && instance_interface.mgmt.clone().unwrap(){
-                        continue;
+                if let Some(owner_ref) = object.metadata.owner_references.as_ref(){
+                    if owner_ref.len() == 1 && owner_ref[0].kind == "Network"{
+                        object_list.push(ObjectRef::new(&owner_ref[0].name).
+                        within(&object.metadata.namespace.clone().unwrap()));
                     }
-                    let network: ObjectRef<Network> = ObjectRef::new(instance_interface.network.name.as_ref().unwrap()).
-                    within(&object.metadata.namespace.clone().unwrap());
-                    object_list.push(network);
                 }
-                */
                 object_list.into_iter()
             }
         )
-        */
     }
     pub async fn reconcile(g: Arc<Network>, ctx: Arc<ResourceClient<Network>>) ->  Result<Action, ReconcileError> {        
         info!("reconciling network: {:?}", g.metadata.name);
@@ -99,6 +98,74 @@ impl Network{
             network.status = Some(status);
             ctx.update_status(&network).await?;
         }
+
+        match ctx.get::<flowtable::Flowtable>(&g.metadata).await?{
+            Some(_) => {},
+            None => {
+                let flow_table = flowtable::Flowtable{
+                    metadata: ObjectMeta{
+                        name: network.metadata.name.clone(),
+                        namespace: network.metadata.namespace.clone(),
+                        owner_references: Some(vec![
+                            OwnerReference{
+                                api_version: "virt.dev/v1".to_string(),
+                                kind: "Network".to_string(),
+                                name: network.metadata.name.as_ref().unwrap().clone(),
+                                uid: network.metadata.uid.as_ref().unwrap().clone(),
+                                ..Default::default()
+                            }
+                        ]),
+                        ..Default::default()
+                    }, 
+                    spec: flowtable::FlowtableSpec{
+                        flow_table_type: flowtable::FlowTableType::Network,
+                    },
+                    status: None,
+                };
+                ctx.create(&flow_table).await?;
+            }
+        }
+
+        /*
+        match ctx.get::<flowtable::Flowtable>(&g.metadata).await?{
+            Some(_) => {},
+            None => {
+                let mut flow_table_meta_data = g.metadata.clone();
+                flow_table_meta_data.owner_references = Some(vec![
+                    OwnerReference{
+                        api_version: "virt.dev/v1".to_string(),
+                        kind: "Network".to_string(),
+                        name: network.metadata.name.as_ref().unwrap().clone(),
+                        uid: network.metadata.uid.as_ref().unwrap().clone(),
+                        ..Default::default()
+                    }
+                ]);
+                let flow_table = flowtable::Flowtable{
+                    metadata: flow_table_meta_data,
+                    spec: flowtable::FlowtableSpec{
+                        network: LocalObjectReference{
+                            name: network.metadata.name.clone(),
+                        },
+                    },
+                    status: None,
+                };
+                ctx.create(&flow_table).await?;
+            }
+        }
+
+        let interface_list: Option<kube::core::ObjectList<Interface>> = ctx.list(
+            &network.metadata.namespace.unwrap(),
+            Some(BTreeMap::from([(
+                "network".to_string(),
+                network.metadata.name.as_ref().unwrap().clone()
+        )]))).await?;
+    
+        if let Some(interface_list) = interface_list{
+            for interface in interface_list.items{
+
+            }
+        }
+        */
 
         /*
         let mut update_status = false;

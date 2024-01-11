@@ -62,6 +62,10 @@ pub enum LxdCommand{
 		String,
 		tokio::sync::oneshot::Sender<Option<InstanceInterface>>,
 	),
+	InterfaceCount(
+		String,
+		tokio::sync::oneshot::Sender<Option<u32>>,
+	),
 }
 
 impl LxdClient{
@@ -159,6 +163,12 @@ impl LxdClient{
 			}
 		}).ok_or_else(|| anyhow!("interface not found"))
 	}
+
+	pub async fn get_interface_count(&self, instance_name: &str) -> anyhow::Result<Option<u32>>{
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.tx.send(LxdCommand::InterfaceCount(instance_name.to_string(), tx)).await?;
+		Ok(rx.await?)
+	}
 	
 	pub async fn get_instance_interface_index(&self, interface_name: &str, instance_name: &str) -> anyhow::Result<i32> {
 		let mut cmd = Command::new("lxc");
@@ -226,6 +236,20 @@ impl LxdManager{
 			tokio::select! {
 				Some(cmd) = self.rx.recv() => {
 					match cmd {
+						LxdCommand::InterfaceCount(instance_name, tx) => {
+							let interface_count = self.interface_count(instance_name).await;
+							let count = match interface_count{
+								Ok(interface_count) => {
+									Some(interface_count)
+								},
+								Err(e) => {
+									None
+								},
+							};
+							if let Err(e) = tx.send(count){
+								error!("failed to send interface count: {:?}", e);
+							}
+						},
 						LxdCommand::Delete(name, tx) => {
 							match self.instance_delete(&name, now).await{
 								Ok(_) => {
@@ -373,7 +397,7 @@ impl LxdManager{
 		}	
 	}
 
-	pub async fn run_cmd(&mut self, mut cmd: Command, now: tokio::time::Instant) -> anyhow::Result<()>{
+	pub async fn run_cmd(&mut self, cmd: &mut Command, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let res = cmd.output().await;
 		match res {
 			Ok(res) => {
@@ -394,6 +418,15 @@ impl LxdManager{
 		Ok(())
 	}
 
+	pub async fn interface_count(&mut self, instance_name: String) -> anyhow::Result<u32>{
+		if let Some(instance_state) = self.lxd_monitor_client.get_state(instance_name).await?{
+			if let Some(devices) = instance_state.devices{
+				return Ok(devices.len() as u32);
+			}
+		}
+		Ok(0)
+	}
+
 	pub async fn delete_interface(&mut self, instance: Instance, interface_name: String, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let instance_name = instance.metadata.name.clone().unwrap();
 		let mut cmd = Command::new("lxc");
@@ -402,12 +435,12 @@ impl LxdManager{
 			arg("remove").
 			arg(&instance_name).
 			arg(&interface_name);
-		self.run_cmd(cmd, now).await
+		self.run_cmd(&mut cmd, now).await
 	}
 
 	pub async fn instance_define(&mut self, instance: Instance, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let mut cmd = Command::new("lxc");
-        cmd.arg("init").
+        cmd.arg("launch").
             arg(instance.spec.image.clone()).
             arg(instance.metadata.name.clone().unwrap()).
             arg("--vm").
@@ -415,23 +448,25 @@ impl LxdManager{
             arg(format!("limits.cpu={}", instance.spec.vcpu)).
             arg("-c").
             arg(format!("limits.memory={}", instance.spec.memory));
-		self.run_cmd(cmd, now).await
+		self.run_cmd(&mut cmd, now).await
 	}
 
 	pub async fn instance_start(&mut self, instance: Instance, now: tokio::time::Instant) -> anyhow::Result<()>{
 		let mut cmd = Command::new("lxc");
         cmd.arg("start").
             arg(instance.metadata.name.clone().unwrap());
-		self.run_cmd(cmd, now).await
+		self.run_cmd(&mut cmd, now).await
 	}
 
 	pub async fn interface_define(&mut self, instance_name: String, interface_config: InterfaceConfig, now: tokio::time::Instant) -> anyhow::Result<()>{
+		let idx = self.interface_count(instance_name.clone()).await?;
 		let mut cmd = Command::new("lxc");
 		cmd.arg("config")
 			.arg("device")
 			.arg("add")
 			.arg(&instance_name)
-			.arg(format!("eth{}", interface_config.pci_idx + 1))
+			//.arg(format!("eth{}", interface_config.pci_idx + 1))
+			.arg(format!("eth{}", idx + 1))
 			.arg("nic")
 			.arg("nictype=routed")
 			.arg(format!("ipv4.address={}", interface_config.ipv4))
@@ -440,7 +475,18 @@ impl LxdManager{
 			.arg(format!("hwaddr={}", interface_config.mac))
 			.arg(format!("name={}", interface_config.name))
 			.arg(format!("host_name={}-{}",instance_name, interface_config.name));
-		self.run_cmd(cmd, now).await
+		for i in 0..5{
+			if let Err(_) = self.run_cmd(&mut cmd, now).await{
+				tokio::time::sleep(Duration::from_millis(1000)).await;
+				if i == 4 {
+					return Err(anyhow!("failed to define interface: {:?}", cmd));
+				}
+			} else {
+				break;
+			}
+		}
+		Ok(())
+		//self.run_cmd(&mut cmd, now).await
 	}
 
     pub async fn instance_delete(&mut self, name: &str, now: tokio::time::Instant) -> anyhow::Result<()>{
@@ -448,7 +494,7 @@ impl LxdManager{
         cmd.arg("delete").
             arg(name).
             arg("--force");
-		self.run_cmd(cmd, now).await
+		self.run_cmd(&mut cmd, now).await
     }
 }
 
